@@ -1547,6 +1547,7 @@ export default function App() {
   const selectionRef = React.useRef(null);
   const clipboardRef = React.useRef(null);
   const hoveredCellRef = React.useRef(null);
+  const hoveredArrangementCellRef = React.useRef(null);
   const selectionGestureRef = React.useRef({
     anchor: null,
     active: false,
@@ -1768,6 +1769,66 @@ export default function App() {
     });
   }, [commitEditor]);
 
+  const copyArrangementSelection = React.useCallback(() => {
+    const selected = arrangementSelection;
+    if (!selected) return;
+    const section = arrangementSectionsRef.current.find((item) => item.id === selected.sectionId);
+    if (!section?.editor?.systems?.length) return;
+    const rows = [];
+    for (let row = selected.rowStart; row <= selected.rowEnd; row += 1) {
+      const values = [];
+      for (let absoluteStep = selected.stepStart; absoluteStep <= selected.stepEnd; absoluteStep += 1) {
+        const cell = getCellFromAbsoluteStep(absoluteStep, row);
+        values.push(section.editor.systems[cell.systemIndex]?.[cell.rowIndex]?.[cell.stepIndex] || "");
+      }
+      rows.push(values);
+    }
+    clipboardRef.current = {
+      kind: "arrangement",
+      sectionId: selected.sectionId,
+      width: selected.stepEnd - selected.stepStart + 1,
+      height: selected.rowEnd - selected.rowStart + 1,
+      rows,
+    };
+  }, [arrangementSelection]);
+
+  const pasteArrangementClipboardAtPointer = React.useCallback(() => {
+    const target = hoveredArrangementCellRef.current;
+    const copied = clipboardRef.current;
+    if (!target || !copied?.rows?.length) return;
+    const targetStartStep = getAbsoluteStep(target);
+    let maxStep = targetStartStep;
+    let nextSelection = null;
+    setArrangementSections((items) =>
+      items.map((section) => {
+        if (section.id !== target.sectionId) return section;
+        const editorCopy = cloneEditor(section.editor);
+        maxStep = Math.max(0, editorCopy.systems.length * STEP_LABELS.length - 1);
+        copied.rows.forEach((rowValues, rowOffset) => {
+          const targetRowIndex = target.rowIndex + rowOffset;
+          if (targetRowIndex < 0 || targetRowIndex >= HAND_LABELS.length) return;
+          rowValues.forEach((value, colOffset) => {
+            const absoluteStep = targetStartStep + colOffset;
+            if (absoluteStep > maxStep) return;
+            const targetCell = getCellFromAbsoluteStep(absoluteStep, targetRowIndex);
+            const targetRow = editorCopy.systems[targetCell.systemIndex]?.[targetCell.rowIndex];
+            if (!targetRow) return;
+            targetRow[targetCell.stepIndex] = value || "";
+          });
+        });
+        nextSelection = {
+          sectionId: target.sectionId,
+          rowStart: target.rowIndex,
+          rowEnd: Math.min(target.rowIndex + copied.height - 1, HAND_LABELS.length - 1),
+          stepStart: targetStartStep,
+          stepEnd: Math.min(targetStartStep + copied.width - 1, maxStep),
+        };
+        return { ...section, editor: editorCopy };
+      })
+    );
+    if (nextSelection) setArrangementSelection(nextSelection);
+  }, []);
+
   const clearSelection = React.useCallback(() => {
     const selected = selectionRef.current;
     if (!selected) return;
@@ -1809,15 +1870,17 @@ export default function App() {
       const key = event.key.toLowerCase();
       if (key === "c") {
         event.preventDefault();
-        copySelection();
+        if (previewModeRef.current === PREVIEW_MODES.print && arrangementSelection) copyArrangementSelection();
+        else copySelection();
       } else if (key === "v") {
         event.preventDefault();
-        pasteClipboardAtPointer();
+        if (previewModeRef.current === PREVIEW_MODES.print) pasteArrangementClipboardAtPointer();
+        else pasteClipboardAtPointer();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [copySelection, pasteClipboardAtPointer]);
+  }, [arrangementSelection, copyArrangementSelection, copySelection, pasteArrangementClipboardAtPointer, pasteClipboardAtPointer]);
 
   React.useEffect(() => {
     const onKeyDown = (event) => {
@@ -2113,6 +2176,8 @@ export default function App() {
 
   const handleArrangementCellPointerDown = React.useCallback((event, cell) => {
     if (event.button != null && event.button !== 0) return;
+    event.preventDefault();
+    hoveredArrangementCellRef.current = cell;
     arrangementSelectionGestureRef.current = {
       anchor: cell,
       active: true,
@@ -2121,6 +2186,7 @@ export default function App() {
   }, []);
 
   const handleArrangementCellPointerEnter = React.useCallback((cell) => {
+    hoveredArrangementCellRef.current = cell;
     const gesture = arrangementSelectionGestureRef.current;
     if (!gesture.active || !gesture.anchor) return;
     const nextSelection = normalizeArrangementSelection(gesture.anchor, cell);
