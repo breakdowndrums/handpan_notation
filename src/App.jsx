@@ -6,6 +6,7 @@ import {
 } from "./exportSequence.js";
 import {
   BLANK_NOTE,
+  BARS_IN_ROW,
   COLORS,
   DISPLAY_MODES,
   FORMAT_PRESETS,
@@ -14,16 +15,34 @@ import {
   LABEL_MODES,
   NOTES,
   OCTAVE_LABEL_MODES,
+  PREVIEW_TUNING,
   SCALE_PRESETS,
+  RESOLUTION_OPTIONS,
+  SUBDIVISION_OPTIONS,
   SYSTEM_SPACING,
   STEP_LABELS,
+  TIME_DENOMINATORS,
   cloneEditor,
   createEmptySystem,
   createSampleOne,
-  createSampleTwo,
+  getComboNoteLabelLayout,
   getDisplayNoteLabel,
+  getDisplayNoteLabelInfo,
+  getBaseSubdivision,
+  getEditorRowWidth,
   getHandLabel,
+  getLayoutRows,
+  getMaxSystemStepCount,
+  getMultiBarFormat,
   getNoteLabelFontSize,
+  getResolutionLabel,
+  getStepCount,
+  getStepBeatIndex,
+  getSubdivisionClass,
+  getSystemStepCount,
+  getSystemStepLabels,
+  getSystemSubdivisions,
+  getVisibleCellNote,
   getSystemGap,
   getSystemLayout,
   normalizeEditor,
@@ -35,12 +54,24 @@ import {
 const DRAFT_STORAGE_KEY = "handpan-notation-draft-v1";
 const LIBRARY_STORAGE_KEY = "handpan-notation-library-v1";
 const ARRANGEMENT_STORAGE_KEY = "handpan-notation-print-arrangement-v1";
+const ROW_SPACING_DEFAULTS_STORAGE_KEY = "handpan-notation-row-spacing-defaults-v1";
 const HISTORY_LIMIT = 120;
 const SELECTION_HOLD_MS = 260;
 const PREVIEW_MODES = {
   editor: "editor",
   print: "print",
 };
+const SIDEBAR_TABS = {
+  settings: "settings",
+  notes: "notes",
+  a4: "a4",
+  library: "library",
+};
+const PREFERENCE_TABS = [
+  { id: "defaults", label: "Defaults" },
+  { id: "grid", label: "Grid" },
+  { id: "layout", label: "Layout" },
+];
 const PLAYBACK_STORAGE_KEY = "handpan-notation-playback-v1";
 const METRONOME_SAMPLES = {
   hi: "/samples/metronome_clave_hi.mp3",
@@ -54,6 +85,11 @@ const DEFAULT_PLAYBACK = {
   volume: 0.75,
   metronomeVolume: 0.55,
 };
+const DEFAULT_ROW_SPACING_BY_MODE = {
+  [DISPLAY_MODES.hands]: 0,
+  [DISPLAY_MODES.rhythm]: -100,
+};
+const COUNT_HOLD_MS = 360;
 const NOTE_FREQUENCIES = {
   D3: 146.83,
   A3: 220,
@@ -79,6 +115,7 @@ const A4_PRINT = {
   barGap: 30,
   handLabelWidth: 116,
 };
+const EDITOR_PREVIEW_FIRST_ROW_Y = 126;
 
 function clampNumber(value, min, max, fallback) {
   const number = Number(value);
@@ -187,6 +224,27 @@ function readPlaybackSettings() {
   return normalizePlaybackSettings(readJson(PLAYBACK_STORAGE_KEY, DEFAULT_PLAYBACK));
 }
 
+function normalizeRowSpacingDefaults(raw) {
+  return {
+    [DISPLAY_MODES.hands]: clampNumber(
+      raw?.[DISPLAY_MODES.hands],
+      SYSTEM_SPACING.min,
+      SYSTEM_SPACING.max,
+      DEFAULT_ROW_SPACING_BY_MODE[DISPLAY_MODES.hands]
+    ),
+    [DISPLAY_MODES.rhythm]: clampNumber(
+      raw?.[DISPLAY_MODES.rhythm],
+      SYSTEM_SPACING.min,
+      SYSTEM_SPACING.max,
+      DEFAULT_ROW_SPACING_BY_MODE[DISPLAY_MODES.rhythm]
+    ),
+  };
+}
+
+function readRowSpacingDefaults() {
+  return normalizeRowSpacingDefaults(readJson(ROW_SPACING_DEFAULTS_STORAGE_KEY, DEFAULT_ROW_SPACING_BY_MODE));
+}
+
 function formatLibraryDate(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
@@ -198,10 +256,10 @@ function isTextEntryTarget(target) {
   return tagName === "input" || tagName === "textarea" || tagName === "select" || target?.isContentEditable;
 }
 
-function normalizeSelection(anchor, focus) {
+function normalizeSelection(anchor, focus, stepCount = STEP_LABELS.length) {
   if (!anchor || !focus) return null;
-  const anchorStep = getAbsoluteStep(anchor);
-  const focusStep = getAbsoluteStep(focus);
+  const anchorStep = getAbsoluteStep(anchor, stepCount);
+  const focusStep = getAbsoluteStep(focus, stepCount);
   return {
     rowStart: Math.min(anchor.rowIndex, focus.rowIndex),
     rowEnd: Math.max(anchor.rowIndex, focus.rowIndex),
@@ -210,15 +268,46 @@ function normalizeSelection(anchor, focus) {
   };
 }
 
-function getAbsoluteStep(cell) {
-  return cell.systemIndex * STEP_LABELS.length + cell.stepIndex;
+function getAbsoluteStep(cell, stepCount = STEP_LABELS.length) {
+  return cell.systemIndex * stepCount + cell.stepIndex;
 }
 
-function getCellFromAbsoluteStep(absoluteStep, rowIndex) {
+function getSubdivisionRanges(subdivisions = []) {
+  let cursor = 0;
+  return subdivisions.map((count) => {
+    const start = cursor;
+    cursor += count;
+    return { start, end: cursor, count };
+  });
+}
+
+function remapSystemToSubdivisions(system, previousSubdivisions, nextSubdivisions) {
+  const previousRanges = getSubdivisionRanges(previousSubdivisions);
+  const nextRanges = getSubdivisionRanges(nextSubdivisions);
+  return system.map((row) => {
+    const nextRow = Array.from({ length: nextSubdivisions.reduce((sum, value) => sum + value, 0) }, () => "");
+    nextRanges.forEach((range, beatIndex) => {
+      const previousRange = previousRanges[beatIndex] || { start: 0, end: 0, count: 0 };
+      const copyCount = Math.min(previousRange.count, range.count);
+      for (let offset = 0; offset < copyCount; offset += 1) {
+        nextRow[range.start + offset] = row[previousRange.start + offset] || "";
+      }
+    });
+    return nextRow;
+  });
+}
+
+function getStepDurationMs(editor, systemIndex, stepIndex, effectiveBpm) {
+  const beatIndex = getStepBeatIndex(editor, systemIndex, stepIndex);
+  const subdivision = getSystemSubdivisions(editor, systemIndex)[beatIndex] || getBaseSubdivision(editor);
+  return (60_000 / effectiveBpm) / Math.max(1, subdivision);
+}
+
+function getCellFromAbsoluteStep(absoluteStep, rowIndex, stepCount = STEP_LABELS.length) {
   return {
-    systemIndex: Math.floor(absoluteStep / STEP_LABELS.length),
+    systemIndex: Math.floor(absoluteStep / stepCount),
     rowIndex,
-    stepIndex: absoluteStep % STEP_LABELS.length,
+    stepIndex: absoluteStep % stepCount,
   };
 }
 
@@ -303,22 +392,13 @@ function mapNoteBetweenScales(note, sourceMap, targetMap) {
   return mapped.missing ? "" : mapped.note;
 }
 
-function clearHiddenRhythmRows(editor) {
-  const copy = cloneEditor(editor);
-  copy.systems = copy.systems.map((system) =>
-    system.map((row, rowIndex) => (rowIndex === 0 ? [...row] : row.map(() => "")))
-  );
-  return copy;
-}
-
 function normalizeEditorForDisplayMode(editor, displayMode) {
-  const next = { ...cloneEditor(editor), displayMode };
-  return displayMode === DISPLAY_MODES.rhythm ? clearHiddenRhythmRows(next) : next;
+  return { ...cloneEditor(editor), displayMode };
 }
 
-function isCellInSelection(cell, selection) {
+function isCellInSelection(cell, selection, stepCount = STEP_LABELS.length) {
   if (!cell || !selection) return false;
-  const absoluteStep = getAbsoluteStep(cell);
+  const absoluteStep = getAbsoluteStep(cell, stepCount);
   return (
     cell.rowIndex >= selection.rowStart &&
     cell.rowIndex <= selection.rowEnd &&
@@ -327,10 +407,10 @@ function isCellInSelection(cell, selection) {
   );
 }
 
-function normalizeArrangementSelection(anchor, focus) {
+function normalizeArrangementSelection(anchor, focus, stepCount = STEP_LABELS.length) {
   if (!anchor || !focus || anchor.sectionId !== focus.sectionId) return null;
-  const anchorStep = getAbsoluteStep(anchor);
-  const focusStep = getAbsoluteStep(focus);
+  const anchorStep = getAbsoluteStep(anchor, stepCount);
+  const focusStep = getAbsoluteStep(focus, stepCount);
   return {
     sectionId: anchor.sectionId,
     rowStart: Math.min(anchor.rowIndex, focus.rowIndex),
@@ -340,9 +420,9 @@ function normalizeArrangementSelection(anchor, focus) {
   };
 }
 
-function isArrangementCellInSelection(cell, selection) {
+function isArrangementCellInSelection(cell, selection, stepCount = STEP_LABELS.length) {
   if (!cell || !selection || cell.sectionId !== selection.sectionId) return false;
-  const absoluteStep = getAbsoluteStep(cell);
+  const absoluteStep = getAbsoluteStep(cell, stepCount);
   return (
     cell.rowIndex >= selection.rowStart &&
     cell.rowIndex <= selection.rowEnd &&
@@ -353,14 +433,13 @@ function isArrangementCellInSelection(cell, selection) {
 
 function useSheetScale(format) {
   const frameRef = React.useRef(null);
-  const [scale, setScale] = React.useState(0.5);
+  const [scale, setScale] = React.useState(1);
 
   React.useEffect(() => {
     const el = frameRef.current;
     if (!el) return undefined;
     const update = () => {
-      const width = el.getBoundingClientRect().width || format.width;
-      setScale(Math.min(1, width / format.width));
+      setScale(1);
     };
     update();
     const observer = new ResizeObserver(update);
@@ -388,13 +467,109 @@ function ToolbarButton({ active = false, disabled = false, children, ...props })
   );
 }
 
+function SettingsIcon() {
+  return (
+    <span aria-hidden="true" className="masked-panel-icon settings-mask" />
+  );
+}
+
+function LibraryIcon() {
+  return (
+    <span aria-hidden="true" className="masked-panel-icon library-mask" />
+  );
+}
+
+function A4Icon() {
+  return (
+    <span aria-hidden="true" className="masked-panel-icon a4-mask" />
+  );
+}
+
+function ShareIcon() {
+  return (
+    <svg aria-hidden="true" className="share-icon" viewBox="0 0 24 24">
+      <path d="M18 2A3 3 0 0 0 15 5A3 3 0 0 0 15.054688 5.560547L7.939453 9.710938A3 3 0 0 0 6 9A3 3 0 0 0 3 12A3 3 0 0 0 6 15A3 3 0 0 0 7.935547 14.287109L15.054688 18.439453A3 3 0 0 0 15 19A3 3 0 0 0 18 22A3 3 0 0 0 21 19A3 3 0 0 0 18 16A3 3 0 0 0 16.0625 16.712891L8.945312 12.560547A3 3 0 0 0 9 12A3 3 0 0 0 8.945312 11.439453L16.060547 7.289062A3 3 0 0 0 18 8A3 3 0 0 0 21 5A3 3 0 0 0 18 2Z" />
+    </svg>
+  );
+}
+
+function MusicNoteIcon() {
+  return (
+    <span aria-hidden="true" className="masked-panel-icon music-note-mask" />
+  );
+}
+
+function VolumeIcon() {
+  return <span aria-hidden="true" className="volume-icon" />;
+}
+
+function TrashIcon() {
+  return (
+    <svg aria-hidden="true" className="trash-icon" viewBox="0 0 16 16">
+      <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0z" />
+      <path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4zM2.5 3h11V2h-11z" />
+    </svg>
+  );
+}
+
+function NoteLabelPart({ part, className = "", style = undefined }) {
+  if (!part?.text) return null;
+  return (
+    <span className={`note-label-part${className ? ` ${className}` : ""}`} style={style}>
+      {part.text}
+      {part.marker ? <span className={`note-label-marker is-${part.marker}`}>{part.marker === "up" ? "↑" : "↓"}</span> : null}
+    </span>
+  );
+}
+
+function CellNoteLabel({ format, labelInfo }) {
+  const parts = labelInfo?.parts || [];
+  if (!labelInfo?.text || parts.length === 0) return null;
+  if (parts.length >= 2) {
+    const comboLayout = getComboNoteLabelLayout(format, labelInfo);
+    return (
+      <span className="cell-note cell-note-combo">
+        <NoteLabelPart
+          className="combo-part combo-top-left"
+          part={parts[0]}
+          style={{
+            fontSize: comboLayout.topFont,
+            left: comboLayout.topX,
+            top: comboLayout.topY,
+          }}
+        />
+        <span className="combo-plus" style={{ fontSize: comboLayout.plusFont }}>+</span>
+        <NoteLabelPart
+          className="combo-part combo-bottom-right"
+          part={parts[1]}
+          style={{
+            bottom: format.cell - comboLayout.bottomY,
+            fontSize: comboLayout.bottomFont,
+            right: format.cell - comboLayout.bottomX,
+          }}
+        />
+      </span>
+    );
+  }
+  return (
+    <span className="cell-note">
+      <NoteLabelPart part={parts[0]} />
+    </span>
+  );
+}
+
 function TransportHeader({
   bpm,
+  canRedo,
+  canUndo,
   isPlaying,
   onBpmPointerDown,
+  onRedo,
+  onShareToggle,
   onSettingsToggle,
-  onTapTempo,
   onTogglePlay,
+  onUndo,
+  shareOpen,
   settingsOpen,
 }) {
   return (
@@ -418,12 +593,139 @@ function TransportHeader({
         >
           {bpm} BPM
         </button>
-        <button className="transport-tap" onClick={onTapTempo} type="button">
-          Tap
-        </button>
       </div>
-      <div className="header-spacer" />
+      <div className="history-controls">
+        <button
+          aria-expanded={shareOpen}
+          aria-label="Share and export"
+          className={shareOpen ? "is-active" : ""}
+          onClick={onShareToggle}
+          title="Share and export"
+          type="button"
+        >
+          <ShareIcon />
+        </button>
+        <button aria-label="Undo" disabled={!canUndo} onClick={onUndo} type="button">←</button>
+        <button aria-label="Redo" disabled={!canRedo} onClick={onRedo} type="button">→</button>
+      </div>
     </header>
+  );
+}
+
+function ShareExportPopup({ exportStatus, onClose, onExportPng }) {
+  return (
+    <div className="share-popover" role="dialog" aria-label="Share and export">
+      <div className="share-popover-header">
+        <span>Export</span>
+        <button aria-label="Close export menu" onClick={onClose} type="button">×</button>
+      </div>
+      <button className="share-action-button" onClick={onExportPng} type="button">
+        Export 4K PNG
+      </button>
+      {exportStatus ? <div className="share-export-status">{exportStatus}</div> : null}
+    </div>
+  );
+}
+
+function PreferencesDialog({
+  activeTab,
+  editor,
+  onClose,
+  onHandLabelLanguageChange,
+  onPreviewTuningChange,
+  onRowSpacingDefaultChange,
+  onSetTab,
+  onSystemSpacingChange,
+  rowSpacingDefaults,
+}) {
+  return (
+    <div className="dialog-backdrop" onMouseDown={onClose}>
+      <div
+        className="preferences-dialog"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+        aria-label="Preferences"
+      >
+        <div className="preferences-header">
+          <h3>Preferences</h3>
+          <button aria-label="Close preferences" onClick={onClose} title="Close preferences" type="button">
+            ×
+          </button>
+        </div>
+        <div className="preferences-body">
+          <aside className="preferences-nav">
+            {PREFERENCE_TABS.map((tab) => (
+              <button
+                className={activeTab === tab.id ? "is-active" : ""}
+                key={tab.id}
+                onClick={() => onSetTab(tab.id)}
+                type="button"
+              >
+                {tab.label}
+              </button>
+            ))}
+          </aside>
+          <section className="preferences-panel">
+            {activeTab === "defaults" ? (
+              <div className="preference-group">
+                <div className="preference-title">Language</div>
+                <HandLanguageSwitch
+                  language={editor.handLabelLanguage}
+                  onChange={onHandLabelLanguageChange}
+                />
+                <div className="preference-title">Default row spacing</div>
+                <RowSpacingDefaultSlider
+                  label="Hands"
+                  onChange={(value) => onRowSpacingDefaultChange(DISPLAY_MODES.hands, value)}
+                  value={rowSpacingDefaults[DISPLAY_MODES.hands]}
+                />
+                <RowSpacingDefaultSlider
+                  label="Rhythm"
+                  onChange={(value) => onRowSpacingDefaultChange(DISPLAY_MODES.rhythm, value)}
+                  value={rowSpacingDefaults[DISPLAY_MODES.rhythm]}
+                />
+              </div>
+            ) : activeTab === "layout" ? (
+              <div className="preference-group">
+                <div className="preference-title">PNG layout</div>
+                <SpacingSlider
+                  disabled={!FORMAT_PRESETS[editor.formatKey]?.spacingAdjustable || editor.systems.length <= 1}
+                  onChange={onSystemSpacingChange}
+                  value={editor.systemSpacing}
+                />
+                <div className="preference-title">Editor preview</div>
+                <PreviewTuningControls editor={editor} onChange={onPreviewTuningChange} showScale={false} />
+              </div>
+            ) : (
+              <div className="preferences-empty">
+                {PREFERENCE_TABS.find((tab) => tab.id === activeTab)?.label || "Preferences"} preferences will live here.
+              </div>
+            )}
+          </section>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LegalDialog({ onClose }) {
+  return (
+    <div className="dialog-backdrop" onMouseDown={onClose}>
+      <div
+        className="legal-dialog"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+        aria-label="Legal information"
+      >
+        <div className="preferences-header">
+          <h3>Legal</h3>
+          <button aria-label="Close legal information" onClick={onClose} type="button">
+            ×
+          </button>
+        </div>
+        <p>Legal information will be added here.</p>
+      </div>
+    </div>
   );
 }
 
@@ -511,7 +813,40 @@ function PlaybackSettingsPopup({
   );
 }
 
+function FooterActions({ onLegalClick, onPreferencesClick }) {
+  return (
+    <div className="footer-actions" aria-label="Footer links">
+      <button onClick={onPreferencesClick} title="Preferences" type="button">
+        Preferences
+      </button>
+      <span>·</span>
+      <button onClick={onLegalClick} title="Legal information" type="button">
+        Legal
+      </button>
+      <span>·</span>
+      <a
+        href="https://buymeacoffee.com/onlinedrumnotation"
+        rel="noreferrer"
+        target="_blank"
+        title="Buy me a coffee"
+      >
+        Buy me a coffee
+      </a>
+    </div>
+  );
+}
+
 function SiteFooter() {
+  return (
+    <footer className="site-footer">
+      <div className="footer-logo">
+        <img alt="Arne Hertstein" loading="lazy" src="/arnehertstein-logo-text-white.png" />
+      </div>
+    </footer>
+  );
+}
+
+function FooterSeoContent() {
   const [openPanel, setOpenPanel] = React.useState("");
   const panels = [
     {
@@ -521,40 +856,29 @@ function SiteFooter() {
     },
   ];
   return (
-    <footer className="site-footer">
-      <div className="footer-logo">
-        <img alt="Arne Hertstein" src="/arnehertstein-logo-text-white.png" />
-      </div>
-      <div className="footer-accordion">
+    <section className="seo-content" aria-label="Handpan notation tool information">
+      <div className="seo-panel">
         {panels.map((panel) => {
           const open = openPanel === panel.id;
           return (
-            <div className={`footer-panel${open ? " is-open" : ""}`} key={panel.id}>
+            <div className={`seo-details${open ? " is-open" : ""}`} key={panel.id}>
               <button
                 aria-expanded={open}
-                className="footer-panel-trigger"
+                className="seo-summary"
                 onClick={() => setOpenPanel(open ? "" : panel.id)}
                 type="button"
               >
-                <span className="footer-caret">▸</span>
+                <span className="seo-caret">▸</span>
                 <span>{panel.title}</span>
               </button>
-              <div className="footer-panel-body">
+              <div className="seo-body">
                 <p>{panel.text}</p>
               </div>
             </div>
           );
         })}
       </div>
-      <a
-        className="footer-coffee"
-        href="https://buymeacoffee.com/onlinedrumnotation"
-        rel="noreferrer"
-        target="_blank"
-      >
-        Buy me a coffee
-      </a>
-    </footer>
+    </section>
   );
 }
 
@@ -565,40 +889,47 @@ function NotePalette({
   onPreviewNote,
   onSelectNote,
   onSwitchHandsModeChange,
-  onVisibilityChange,
   switchHandsMode,
 }) {
-  const availableNotes = getAvailablePaletteNotes(editor);
+  const [additionalOpen, setAdditionalOpen] = React.useState(false);
+  const availableNotes = getAvailablePaletteNotes(editor).filter((note) => note !== BLANK_NOTE);
   const handleNoteClick = (note) => {
     onSelectNote(note);
     if (listenMode) onPreviewNote(note, editor.noteNameMap);
   };
 
   return (
-    <div className="note-palette" aria-label="Notes">
-      {availableNotes.map((note) => (
-        <ToolbarButton
-          active={activeNote === note}
-          key={note}
-          onClick={() => handleNoteClick(note)}
-        >
-          {note === BLANK_NOTE ? "Blank" : getDisplayNoteLabel(note, editor)}
-        </ToolbarButton>
-      ))}
-      <ToolbarButton active={activeNote === ""} onClick={() => onSelectNote("")}>
-        Erase
-      </ToolbarButton>
-      <ToolbarButton active={switchHandsMode} onClick={() => onSwitchHandsModeChange(!switchHandsMode)}>
-        Switch hands
-      </ToolbarButton>
-      <label className="inline-toggle">
-        <input
-          checked={editor.showNoteLabels}
-          onChange={(event) => onVisibilityChange("showNoteLabels", event.target.checked)}
-          type="checkbox"
-        />
-        <span>Labels</span>
-      </label>
+    <div className="note-palette-wrap">
+      <div className="note-palette" aria-label="Notes">
+        {availableNotes.map((note) => (
+          <ToolbarButton
+            active={activeNote === note}
+            key={note}
+            onClick={() => handleNoteClick(note)}
+          >
+            {getDisplayNoteLabel(note, editor)}
+          </ToolbarButton>
+        ))}
+      </div>
+      <button
+        aria-expanded={additionalOpen}
+        className="disclosure-button compact-disclosure"
+        onClick={() => setAdditionalOpen((value) => !value)}
+        type="button"
+      >
+        <span>Additional</span>
+        <span className="disclosure-caret">{additionalOpen ? "Hide" : "Show"}</span>
+      </button>
+      {additionalOpen ? (
+        <div className="note-palette additional-palette">
+          <ToolbarButton active={activeNote === BLANK_NOTE} onClick={() => handleNoteClick(BLANK_NOTE)}>
+            Blank
+          </ToolbarButton>
+          <ToolbarButton active={switchHandsMode} onClick={() => onSwitchHandsModeChange(!switchHandsMode)}>
+            Switch hand
+          </ToolbarButton>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -606,7 +937,7 @@ function NotePalette({
 function FormatSwitch({ formatKey, onChange }) {
   return (
     <div className="segmented-control" aria-label="Layout">
-      {Object.values(FORMAT_PRESETS).map((format) => (
+      {Object.values(FORMAT_PRESETS).filter((format) => format.key !== "wide").map((format) => (
         <button
           className={format.key === formatKey ? "is-selected" : ""}
           key={format.key}
@@ -638,6 +969,245 @@ function SpacingSlider({ disabled, value, onChange }) {
       />
       <span>{value > 0 ? `+${value}` : value}px</span>
     </div>
+  );
+}
+
+function RowSpacingDefaultSlider({ label, onChange, value }) {
+  return (
+    <div className="spacing-control">
+      <label className="field-label">{label}</label>
+      <input
+        max={SYSTEM_SPACING.max}
+        min={SYSTEM_SPACING.min}
+        onChange={(event) => onChange(Number(event.target.value))}
+        step={SYSTEM_SPACING.step}
+        type="range"
+        value={value}
+      />
+      <span>{value > 0 ? `+${value}` : value}px</span>
+    </div>
+  );
+}
+
+function PreviewTuneSlider({ label, max, min, onChange, step = 1, suffix = "px", value }) {
+  const displayValue = suffix === "x" ? `${Number(value).toFixed(2)}x` : `${value > 0 ? "+" : ""}${value}${suffix}`;
+  return (
+    <div className="spacing-control">
+      <label className="field-label">{label}</label>
+      <input
+        max={max}
+        min={min}
+        onChange={(event) => onChange(Number(event.target.value))}
+        step={step}
+        type="range"
+        value={value}
+      />
+      <span>{displayValue}</span>
+    </div>
+  );
+}
+
+function CompactScaleSlider({ onChange, value }) {
+  return (
+    <div className="compact-scale-control">
+      <label className="stepper-label">Grid scale</label>
+      <input
+        max={PREVIEW_TUNING.scaleMax}
+        min={PREVIEW_TUNING.scaleMin}
+        onChange={(event) => onChange(Number(event.target.value))}
+        step={PREVIEW_TUNING.scaleStep}
+        type="range"
+        value={value}
+      />
+      <span>{`${Number(value).toFixed(2).replace(".", ",")}x`}</span>
+    </div>
+  );
+}
+
+function PreviewTuningControls({ editor, onChange, showScale = true }) {
+  return (
+    <section className="panel-section preview-tuning-section">
+      <PreviewTuneSlider
+        label="Grid X"
+        max={PREVIEW_TUNING.gridOffsetMax}
+        min={PREVIEW_TUNING.gridOffsetMin}
+        onChange={(value) => onChange("previewGridOffsetX", value)}
+        value={editor.previewGridOffsetX}
+      />
+      <PreviewTuneSlider
+        label="Grid Y"
+        max={PREVIEW_TUNING.gridOffsetMax}
+        min={PREVIEW_TUNING.gridOffsetMin}
+        onChange={(value) => onChange("previewGridOffsetY", value)}
+        value={editor.previewGridOffsetY}
+      />
+      <PreviewTuneSlider
+        label="Name X"
+        max={PREVIEW_TUNING.nameOffsetMax}
+        min={PREVIEW_TUNING.nameOffsetMin}
+        onChange={(value) => onChange("previewNameOffsetX", value)}
+        value={editor.previewNameOffsetX}
+      />
+      <PreviewTuneSlider
+        label="Name Y"
+        max={PREVIEW_TUNING.nameOffsetMax}
+        min={PREVIEW_TUNING.nameOffsetMin}
+        onChange={(value) => onChange("previewNameOffsetY", value)}
+        value={editor.previewNameOffsetY}
+      />
+      <PreviewTuneSlider
+        label="Name font size"
+        max={PREVIEW_TUNING.nameFontMax}
+        min={PREVIEW_TUNING.nameFontMin}
+        onChange={(value) => onChange("previewNameFontSize", value)}
+        value={editor.previewNameFontSize}
+      />
+      {showScale ? (
+        <PreviewTuneSlider
+          label="Grid scale"
+          max={PREVIEW_TUNING.scaleMax}
+          min={PREVIEW_TUNING.scaleMin}
+          onChange={(value) => onChange("previewScale", value)}
+          step={PREVIEW_TUNING.scaleStep}
+          suffix="x"
+          value={editor.previewScale}
+        />
+      ) : null}
+    </section>
+  );
+}
+
+function StepperControl({
+  className = "",
+  disabledMinus = false,
+  disabledPlus = false,
+  label,
+  onMinus,
+  onPlus,
+  value,
+}) {
+  return (
+    <div className={`stepper-row${className ? ` ${className}` : ""}`}>
+      <div className="stepper-label">{label}</div>
+      <div className="stepper-control">
+        <button
+          aria-label={`Decrease ${label}`}
+          disabled={disabledMinus || !onMinus}
+          onClick={onMinus}
+          type="button"
+        >
+          −
+        </button>
+        <div className="stepper-value">{value}</div>
+        <button
+          aria-label={`Increase ${label}`}
+          disabled={disabledPlus || !onPlus}
+          onClick={onPlus}
+          type="button"
+        >
+          +
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function TimeStepperControl({ onDenominatorStep, onNumeratorStep, timeSig }) {
+  const safeN = Math.max(2, Math.min(15, Number(timeSig?.n) || 4));
+  const safeD = Number(timeSig?.d) === 8 ? 8 : 4;
+  return (
+    <div className="stepper-row">
+      <div className="stepper-label">Time</div>
+      <div className="time-stepper-control">
+        <div className="time-stepper-buttons">
+          <button aria-label="Increase time signature numerator" onClick={() => onNumeratorStep(1)} type="button">+</button>
+          <button aria-label="Decrease time signature numerator" onClick={() => onNumeratorStep(-1)} type="button">−</button>
+        </div>
+        <div className="time-stepper-value">
+          {safeN}<span>/</span>{safeD}
+        </div>
+        <div className="time-stepper-buttons">
+          <button aria-label="Next time signature denominator" onClick={() => onDenominatorStep(1)} type="button">+</button>
+          <button aria-label="Previous time signature denominator" onClick={() => onDenominatorStep(-1)} type="button">−</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SettingsSteppers({
+  bars,
+  barsInRow,
+  formatKey,
+  resolution,
+  timeSig,
+  onAddBar,
+  onBarsInRowChange,
+  onResolutionChange,
+  onRemoveBar,
+  onSetFormat,
+  onTimeSigChange,
+}) {
+  const formats = Object.values(FORMAT_PRESETS).filter((format) => format.key !== "wide");
+  const currentFormatIndex = Math.max(0, formats.findIndex((format) => format.key === formatKey));
+  const nextFormat = (direction) => {
+    const nextIndex = (currentFormatIndex + direction + formats.length) % formats.length;
+    onSetFormat(formats[nextIndex].key);
+  };
+  const currentResolutionIndex = Math.max(0, RESOLUTION_OPTIONS.indexOf(resolution));
+  const stepResolution = (direction) => {
+    const nextIndex = (currentResolutionIndex + direction + RESOLUTION_OPTIONS.length) % RESOLUTION_OPTIONS.length;
+    onResolutionChange(RESOLUTION_OPTIONS[nextIndex]);
+  };
+  const stepTimeSigNumerator = (direction) => {
+    onTimeSigChange({ ...timeSig, n: Math.max(2, Math.min(15, (Number(timeSig?.n) || 4) + direction)) });
+  };
+  const stepTimeSigDenominator = (direction) => {
+    const currentIndex = Math.max(0, TIME_DENOMINATORS.indexOf(Number(timeSig?.d) || 4));
+    const nextIndex = (currentIndex + direction + TIME_DENOMINATORS.length) % TIME_DENOMINATORS.length;
+    onTimeSigChange({ ...timeSig, d: TIME_DENOMINATORS[nextIndex] });
+  };
+
+  return (
+    <section className="panel-section settings-steppers">
+      <StepperControl
+        label="Resolution"
+        onMinus={() => stepResolution(-1)}
+        onPlus={() => stepResolution(1)}
+        value={getResolutionLabel(resolution)}
+      />
+      <StepperControl
+        disabledMinus={bars <= 1}
+        label="Bars"
+        onMinus={onRemoveBar}
+        onPlus={onAddBar}
+        value={bars}
+      />
+      <TimeStepperControl
+        onDenominatorStep={stepTimeSigDenominator}
+        onNumeratorStep={stepTimeSigNumerator}
+        timeSig={timeSig}
+      />
+      <StepperControl
+        label="Tuplets"
+        value="Off"
+      />
+      <StepperControl
+        className="layout-stepper-row"
+        label="Layout"
+        onMinus={() => nextFormat(-1)}
+        onPlus={() => nextFormat(1)}
+        value={FORMAT_PRESETS[formatKey]?.label || formats[0]?.label || "Stacked"}
+      />
+      <StepperControl
+        disabledMinus={barsInRow <= BARS_IN_ROW.min}
+        disabledPlus={barsInRow >= BARS_IN_ROW.max}
+        label="Bars in row"
+        onMinus={() => onBarsInRowChange(barsInRow - 1)}
+        onPlus={() => onBarsInRowChange(barsInRow + 1)}
+        value={barsInRow}
+      />
+    </section>
   );
 }
 
@@ -706,7 +1276,7 @@ function LabelModeSwitch({ labelMode, onChange }) {
 
 function OctaveModeSwitch({ octaveLabelMode, onChange }) {
   return (
-    <div className="segmented-control three-way" aria-label="Octave display">
+    <div className="tab-switcher three-way" aria-label="Octave display">
       <button
         className={octaveLabelMode === OCTAVE_LABEL_MODES.always ? "is-selected" : ""}
         onClick={() => onChange(OCTAVE_LABEL_MODES.always)}
@@ -732,12 +1302,34 @@ function OctaveModeSwitch({ octaveLabelMode, onChange }) {
   );
 }
 
-function LabelSection({ editor, onLabelModeChange, onOctaveModeChange }) {
+function LabelSection({
+  editor,
+  onLabelDisplayModeChange,
+  onOctaveModeChange,
+}) {
+  const chooseMode = (mode) => {
+    onLabelDisplayModeChange(mode);
+  };
+
   return (
-    <section className="panel-section">
-      <div className="section-title">Labels</div>
-      <LabelModeSwitch labelMode={editor.labelMode} onChange={onLabelModeChange} />
-      {editor.labelMode === LABEL_MODES.names ? (
+    <section className="panel-section notes-label-section">
+      <div className="notes-mode-buttons" aria-label="Label type">
+        <button
+          className={editor.showNoteLabels && editor.labelMode === LABEL_MODES.numbers ? "is-active" : ""}
+          onClick={() => chooseMode(LABEL_MODES.numbers)}
+          type="button"
+        >
+          Numbers
+        </button>
+        <button
+          className={editor.showNoteLabels && editor.labelMode === LABEL_MODES.names ? "is-active" : ""}
+          onClick={() => chooseMode(LABEL_MODES.names)}
+          type="button"
+        >
+          Notes
+        </button>
+      </div>
+      {editor.showNoteLabels && editor.labelMode === LABEL_MODES.names ? (
         <OctaveModeSwitch octaveLabelMode={editor.octaveLabelMode} onChange={onOctaveModeChange} />
       ) : null}
     </section>
@@ -746,43 +1338,55 @@ function LabelSection({ editor, onLabelModeChange, onOctaveModeChange }) {
 
 function ScaleSection({ editor, onPresetChange, onMapChange }) {
   const [expanded, setExpanded] = React.useState(false);
+  const presets = Object.values(SCALE_PRESETS);
+  const currentIndex = Math.max(0, presets.findIndex((preset) => preset.key === editor.scalePresetKey));
+  const stepScale = (direction) => {
+    const nextIndex = (currentIndex + direction + presets.length) % presets.length;
+    onPresetChange(presets[nextIndex].key);
+  };
   const scaleName = SCALE_PRESETS[editor.scalePresetKey]?.label || "Scale";
   return (
-    <section className="panel-section">
-      <div className="section-title">Scale</div>
-      <button
-        className="disclosure-button"
-        onClick={() => setExpanded((value) => !value)}
-        type="button"
-      >
-        <span>{scaleName}</span>
-        <span className="disclosure-caret">{expanded ? "Hide" : "Edit"}</span>
-      </button>
+    <section className="panel-section scale-section">
+      <div className="stepper-control scale-stepper">
+        <button aria-label="Previous scale" onClick={() => stepScale(-1)} type="button">−</button>
+        <button
+          aria-expanded={expanded}
+          className="scale-stepper-name"
+          onClick={() => setExpanded((value) => !value)}
+          type="button"
+        >
+          {scaleName}
+        </button>
+        <button aria-label="Next scale" onClick={() => stepScale(1)} type="button">+</button>
+      </div>
       {expanded ? (
         <ScaleEditor
           editor={editor}
           onMapChange={onMapChange}
           onPresetChange={onPresetChange}
+          showPreset={false}
         />
       ) : null}
     </section>
   );
 }
 
-function ScaleEditor({ editor, onPresetChange, onMapChange }) {
+function ScaleEditor({ editor, onPresetChange, onMapChange, showPreset = true }) {
   return (
     <div className="scale-editor">
-      <select
-        aria-label="Scale preset"
-        onChange={(event) => onPresetChange(event.target.value)}
-        value={editor.scalePresetKey}
-      >
-        {Object.values(SCALE_PRESETS).map((preset) => (
-          <option key={preset.key} value={preset.key}>
-            {preset.label}
-          </option>
-        ))}
-      </select>
+      {showPreset ? (
+        <select
+          aria-label="Scale preset"
+          onChange={(event) => onPresetChange(event.target.value)}
+          value={editor.scalePresetKey}
+        >
+          {Object.values(SCALE_PRESETS).map((preset) => (
+            <option key={preset.key} value={preset.key}>
+              {preset.label}
+            </option>
+          ))}
+        </select>
+      ) : null}
       <div className="scale-map-grid">
         {NOTES.filter((note) => note !== BLANK_NOTE && !note.includes("+")).map((note) => (
           <label key={note}>
@@ -803,23 +1407,49 @@ function ScaleEditor({ editor, onPresetChange, onMapChange }) {
 function NotationStage({
   editor,
   activeNote,
+  onGridLeftChange,
   onCellClick,
   onCellPointerDown,
   onCellPointerEnter,
+  onCountClick,
+  onCountPointerDown,
+  onCountPointerUp,
   onRowLabelClick,
   playheadStep,
   selection,
 }) {
-  const baseFormat = FORMAT_PRESETS[editor.formatKey] || FORMAT_PRESETS.wide;
+  const baseFormat = FORMAT_PRESETS[editor.formatKey] || FORMAT_PRESETS.tallTopCount;
   const format = getEditorPreviewFormat(baseFormat, editor);
-  const [frameRef, scale] = useSheetScale(format);
-  const frameHeight = Math.max(1, Math.round(format.height * scale));
+  const stepCount = getMaxSystemStepCount(editor);
+  const [frameRef] = useSheetScale(format);
+  const scale = editor.previewScale || 1;
+  const previewHeight = getEditorPreviewVisibleHeight(format, editor);
+  const frameHeight = Math.max(1, Math.round(previewHeight * scale));
+
+  React.useLayoutEffect(() => {
+    if (!frameRef.current || !onGridLeftChange) return;
+    const previewPanel = frameRef.current.closest(".preview-panel");
+    if (!previewPanel) return;
+    const frameRect = frameRef.current.getBoundingClientRect();
+    const panelRect = previewPanel.getBoundingClientRect();
+    const layout = getSystemLayout(
+      format,
+      editor.systems.length,
+      0,
+      editor.displayMode,
+      editor.systemSpacing,
+      editor.barsInRow,
+      stepCount,
+      editor
+    );
+    onGridLeftChange(frameRect.left - panelRect.left + layout.x * scale);
+  }, [editor.barsInRow, editor.displayMode, editor.resolution, editor.subdivisions, editor.systemSpacing, editor.systems.length, editor.timeSig, format, frameRef, onGridLeftChange, scale, stepCount]);
 
   return (
     <div
       className="sheet-frame"
       ref={frameRef}
-      style={{ height: `${frameHeight}px` }}
+      style={{ height: `${frameHeight}px`, width: `${Math.round(format.width * scale)}px` }}
     >
       <div
         className="notation-sheet"
@@ -827,7 +1457,6 @@ function NotationStage({
           "--sheet-w": `${format.width}px`,
           "--sheet-h": `${format.height}px`,
           "--sheet-scale": scale,
-          background: COLORS.background,
         }}
       >
         {editor.systems.map((system, systemIndex) => (
@@ -838,12 +1467,17 @@ function NotationStage({
             onCellClick={onCellClick}
             onCellPointerDown={onCellPointerDown}
             onCellPointerEnter={onCellPointerEnter}
+            onCountClick={onCountClick}
+            onCountPointerDown={onCountPointerDown}
+            onCountPointerUp={onCountPointerUp}
             onRowLabelClick={onRowLabelClick}
             system={system}
             systemCount={editor.systems.length}
             systemIndex={systemIndex}
+            barsInRow={editor.barsInRow}
             displayMode={editor.displayMode}
             systemSpacing={editor.systemSpacing}
+            editor={editor}
             showNoteLabels={editor.showNoteLabels}
             labelMode={editor.labelMode}
             handLabelLanguage={editor.handLabelLanguage}
@@ -860,26 +1494,74 @@ function NotationStage({
 
 function getEditorPreviewFormat(format, editor) {
   const systemCount = Math.max(1, editor.systems.length);
+  const multiBarFormat = getMultiBarFormat(format, systemCount, editor.barsInRow, getMaxSystemStepCount(editor));
+  const previewX = Math.max(0, multiBarFormat.x - 150 + editor.previewGridOffsetX);
+  const handLabelInset = multiBarFormat.x - multiBarFormat.labelX;
+  const isRhythm = editor.displayMode === DISPLAY_MODES.rhythm;
+  const handsHeight = multiBarFormat.cell * 2 + multiBarFormat.rowGap;
+  const previewY = isRhythm
+    ? EDITOR_PREVIEW_FIRST_ROW_Y - (handsHeight - multiBarFormat.cell) / 2
+    : EDITOR_PREVIEW_FIRST_ROW_Y;
+  const previewFormat = {
+    ...multiBarFormat,
+    x: previewX,
+    labelX: previewX - handLabelInset,
+    y: previewY + editor.previewGridOffsetY,
+  };
+  const rowCount = getLayoutRows(systemCount, editor.barsInRow);
+  const widestRow = Math.max(...Array.from({ length: rowCount }, (_, rowIndex) => getEditorRowWidth(previewFormat, editor, rowIndex)));
+  const neededWidth = previewFormat.x + widestRow + 32;
+  previewFormat.width = Math.ceil(neededWidth);
+  const systemHeight = isRhythm ? previewFormat.cell : handsHeight;
+  const baseY = isRhythm
+    ? previewFormat.y + (handsHeight - previewFormat.cell) / 2
+    : previewFormat.y;
+  const neededHeight =
+    baseY +
+    (rowCount - 1) * getSystemGap(previewFormat, editor.systemSpacing) +
+    systemHeight +
+    previewFormat.bottomPadding;
+  if (neededHeight <= previewFormat.height) return previewFormat;
+  return { ...previewFormat, height: Math.ceil(neededHeight) };
+}
+
+function getEditorPreviewVisibleHeight(format, editor) {
+  const systemCount = Math.max(1, editor.systems.length);
+  const rowCount = getLayoutRows(systemCount, editor.barsInRow);
   const isRhythm = editor.displayMode === DISPLAY_MODES.rhythm;
   const handsHeight = format.cell * 2 + format.rowGap;
   const systemHeight = isRhythm ? format.cell : handsHeight;
-  const baseY = isRhythm ? format.y + (handsHeight - format.cell) / 2 : format.y;
-  const neededHeight =
-    baseY +
-    (systemCount - 1) * getSystemGap(format, editor.systemSpacing) +
+  const firstLayout = getSystemLayout(
+    format,
+    systemCount,
+    0,
+    editor.displayMode,
+    editor.systemSpacing,
+    editor.barsInRow,
+    getMaxSystemStepCount(editor),
+    editor
+  );
+  const compactBottomPadding = Math.max(44, Math.round(format.bottomPadding * 0.25));
+  const visibleHeight =
+    firstLayout.y +
+    (rowCount - 1) * getSystemGap(format, editor.systemSpacing) +
     systemHeight +
-    format.bottomPadding;
-  if (neededHeight <= format.height) return format;
-  return { ...format, height: Math.ceil(neededHeight) };
+    compactBottomPadding;
+  return Math.max(1, Math.min(format.height, Math.ceil(visibleHeight)));
 }
 
 function SystemView({
   activeNote,
+  barsInRow,
   displayMode,
+  editor,
   format,
   onCellClick,
   onCellPointerDown,
   onCellPointerEnter,
+  onCountClick,
+  onCountPointerDown,
+  onCountPointerUp,
   onRowLabelClick,
   system,
   systemCount,
@@ -895,18 +1577,31 @@ function SystemView({
 }) {
   const isRhythm = displayMode === DISPLAY_MODES.rhythm;
   const visibleRows = isRhythm ? [0] : HAND_LABELS.map((_, index) => index);
-  const layout = getSystemLayout(format, systemCount, systemIndex, displayMode, systemSpacing);
+  const labels = getSystemStepLabels(editor, systemIndex);
+  const subdivisions = getSystemSubdivisions(editor, systemIndex);
+  const baseSubdivision = getBaseSubdivision(editor);
+  const stepCount = labels.length;
+  const layout = getSystemLayout(format, systemCount, systemIndex, displayMode, systemSpacing, barsInRow, stepCount, editor);
   const headerY = layout.y - format.headerOffset;
   const showCountLabels = shouldShowCountLabels(format, systemIndex);
+  const showHandLabels = !isRhythm && layout.columnIndex === 0;
 
   return (
     <>
-      {showCountLabels ? STEP_LABELS.map((label, stepIndex) => {
+      {showCountLabels ? labels.map((label, stepIndex) => {
         const x = layout.x + stepIndex * (format.cell + format.gap);
+        const beatIndex = getStepBeatIndex(editor, systemIndex, stepIndex);
+        const subdivisionClass = getSubdivisionClass(subdivisions[beatIndex], baseSubdivision);
         return (
-          <div
-            className={`step-label${label === "&" ? " is-amp" : ""}`}
+          <button
+            aria-label={`Subdivision beat ${beatIndex + 1}`}
+            className={`step-label${label === "&" ? " is-amp" : ""} ${subdivisionClass}`}
+            data-count-cell="1"
             key={`${systemIndex}-step-${stepIndex}`}
+            onClick={() => onCountClick?.(systemIndex, beatIndex)}
+            onPointerDown={(event) => onCountPointerDown?.(event, systemIndex, beatIndex)}
+            onPointerUp={onCountPointerUp}
+            onPointerCancel={onCountPointerUp}
             style={{
               left: x,
               top: headerY,
@@ -914,9 +1609,10 @@ function SystemView({
               height: format.cell * 0.62,
               fontSize: label === "&" ? format.ampFont : format.headerFont,
             }}
+            type="button"
           >
             {label}
-          </div>
+          </button>
         );
       }) : null}
 
@@ -925,14 +1621,14 @@ function SystemView({
         const rowY = layout.y + visibleRowIndex * (format.cell + format.rowGap);
         return (
           <React.Fragment key={`${systemIndex}-${hand}`}>
-            {!isRhythm ? (
+            {showHandLabels ? (
               <div
                 className="hand-label"
                 onClick={() => onRowLabelClick(systemIndex, rowIndex)}
                 style={{
-                  left: 0,
+                  left: layout.x - format.labelX,
                   top: rowY,
-                  width: format.labelX,
+                  width: format.labelX - (format.x - format.labelX),
                   height: format.cell,
                   fontSize: format.labelFont,
                 }}
@@ -940,17 +1636,22 @@ function SystemView({
                 {hand}
               </div>
             ) : null}
-            {STEP_LABELS.map((_, stepIndex) => {
-              const note = system[rowIndex]?.[stepIndex] || "";
-              const label = getDisplayNoteLabel(note, { labelMode, noteNameMap, octaveLabelMode });
+            {labels.map((_, stepIndex) => {
+              const note = getVisibleCellNote(system, rowIndex, stepIndex, displayMode);
+              const labelInfo = getDisplayNoteLabelInfo(note, { labelMode, noteNameMap, octaveLabelMode });
+              const label = labelInfo.text;
               const cell = { systemIndex, rowIndex, stepIndex };
-              const selected = isCellInSelection(cell, selection);
-              const isPlayingStep = playheadStep === getAbsoluteStep(cell);
+              const selected = isCellInSelection(cell, selection, stepCount);
+              const isPlayingStep =
+                playheadStep?.systemIndex === systemIndex && playheadStep?.stepIndex === stepIndex;
               const x = layout.x + stepIndex * (format.cell + format.gap);
+              const beatIndex = getStepBeatIndex(editor, systemIndex, stepIndex);
+              const subdivisionClass = getSubdivisionClass(subdivisions[beatIndex], baseSubdivision);
+              const quarterClass = editor.resolution >= 16 && beatIndex % 2 === 1 ? " is-quarter-alt" : "";
               return (
                 <button
-                  aria-label={`${hand} ${STEP_LABELS[stepIndex]} ${note || "empty"}`}
-                  className={`notation-cell${note ? " is-note" : ""}${activeNote && note === activeNote ? " is-matching-note" : ""}${selected ? " is-selected" : ""}${isPlayingStep ? " is-playing-step" : ""}`}
+                  aria-label={`${hand} ${labels[stepIndex] || stepIndex + 1} ${note || "empty"}`}
+                  className={`notation-cell ${subdivisionClass}${quarterClass}${note ? " is-note" : ""}${activeNote && note === activeNote ? " is-matching-note" : ""}${selected ? " is-selected" : ""}${isPlayingStep ? " is-playing-step" : ""}`}
                   data-notation-cell="1"
                   data-system={systemIndex}
                   data-row={rowIndex}
@@ -968,7 +1669,7 @@ function SystemView({
                   }}
                   type="button"
                 >
-                  {showNoteLabels ? <span className="cell-note">{label}</span> : null}
+                  {showNoteLabels ? <CellNoteLabel format={format} labelInfo={labelInfo} /> : null}
                 </button>
               );
             })}
@@ -1040,7 +1741,7 @@ function LibraryPanel({ library, onAddToArrangement, onDelete, onLoad, onRename,
 
 function PreviewModeSwitch({ mode, onChange }) {
   return (
-    <div className="segmented-control" aria-label="Preview mode">
+    <div className="segmented-control preview-tabs" aria-label="Preview mode">
       <button
         className={mode === PREVIEW_MODES.editor ? "is-selected" : ""}
         onClick={() => onChange(PREVIEW_MODES.editor)}
@@ -1059,13 +1760,90 @@ function PreviewModeSwitch({ mode, onChange }) {
   );
 }
 
+function CanvasNameField({
+  arrangementTitle,
+  gridLeft = null,
+  nameOffsetX = 0,
+  nameOffsetY = 0,
+  nameFontSize = 22,
+  onArrangementTitleChange,
+  onTitleChange,
+  previewMode,
+  title,
+}) {
+  const isPrint = previewMode === PREVIEW_MODES.print;
+  const left = !isPrint && Number.isFinite(gridLeft) ? gridLeft + nameOffsetX : 126 + nameOffsetX;
+  return (
+    <label
+      className="canvas-name-field"
+      style={{
+        fontSize: `${nameFontSize}px`,
+        left: `${Math.round(left)}px`,
+        transform: `translateY(${nameOffsetY}px)`,
+      }}
+    >
+      <input
+        aria-label={isPrint ? "A4 arrangement name" : "Notation name"}
+        onChange={(event) =>
+          isPrint ? onArrangementTitleChange(event.target.value) : onTitleChange(event.target.value)
+        }
+        spellCheck="false"
+        type="text"
+        value={isPrint ? arrangementTitle : title}
+      />
+    </label>
+  );
+}
+
+function WorkspaceIconRail({ onSidebarToggle, sidebarTab }) {
+  return (
+    <div className="workspace-icon-rail" aria-label="Panels">
+      <button
+        aria-label="Settings"
+        aria-pressed={sidebarTab === SIDEBAR_TABS.settings}
+        className={`workspace-icon-button${sidebarTab === SIDEBAR_TABS.settings ? " is-active" : ""}`}
+        onClick={() => onSidebarToggle(SIDEBAR_TABS.settings)}
+        type="button"
+      >
+        <SettingsIcon />
+      </button>
+      <button
+        aria-label="Notes"
+        aria-pressed={sidebarTab === SIDEBAR_TABS.notes}
+        className={`workspace-icon-button${sidebarTab === SIDEBAR_TABS.notes ? " is-active" : ""}`}
+        onClick={() => onSidebarToggle(SIDEBAR_TABS.notes)}
+        type="button"
+      >
+        <MusicNoteIcon />
+      </button>
+      <button
+        aria-label="Library"
+        aria-pressed={sidebarTab === SIDEBAR_TABS.library}
+        className={`workspace-icon-button${sidebarTab === SIDEBAR_TABS.library ? " is-active" : ""}`}
+        onClick={() => onSidebarToggle(SIDEBAR_TABS.library)}
+        type="button"
+      >
+        <LibraryIcon />
+      </button>
+      <button
+        aria-label="A4"
+        aria-pressed={sidebarTab === SIDEBAR_TABS.a4}
+        className={`workspace-icon-button${sidebarTab === SIDEBAR_TABS.a4 ? " is-active" : ""}`}
+        onClick={() => onSidebarToggle(SIDEBAR_TABS.a4)}
+        type="button"
+      >
+        <A4Icon />
+      </button>
+    </div>
+  );
+}
+
 function ArrangementPanel({
   arrangementTitle,
   scalePresetKey,
   sections,
   onAddCurrent,
   onArrangementTitleChange,
-  onDuplicate,
   onLoad,
   onMove,
   onNameChange,
@@ -1076,7 +1854,6 @@ function ArrangementPanel({
 }) {
   return (
     <section className="panel-section arrangement-section">
-      <div className="section-title">A4 Arrangement</div>
       <input
         aria-label="A4 arrangement title"
         onChange={(event) => onArrangementTitleChange(event.target.value)}
@@ -1085,7 +1862,7 @@ function ArrangementPanel({
         type="text"
         value={arrangementTitle}
       />
-      <label className="field-label" htmlFor="arrangement-scale">
+      <label className="stepper-label" htmlFor="arrangement-scale">
         A4 scale
       </label>
       <select
@@ -1110,41 +1887,74 @@ function ArrangementPanel({
         ) : (
           sections.map((section, index) => (
             <div className="arrangement-item" key={section.id}>
-              <input
-                aria-label="Arrangement section name"
-                onChange={(event) => onNameChange(section.id, event.target.value)}
-                spellCheck="false"
-                type="text"
-                value={section.name}
-              />
-              <small>
-                {section.editor.systems.length} bar{section.editor.systems.length === 1 ? "" : "s"}
-              </small>
+              <button
+                aria-label={`Edit ${section.name}`}
+                className="arrangement-card"
+                onClick={() => onLoad(section)}
+                type="button"
+              >
+                <input
+                  aria-label="Arrangement section name"
+                  onClick={(event) => event.stopPropagation()}
+                  onChange={(event) => onNameChange(section.id, event.target.value)}
+                  spellCheck="false"
+                  style={{ width: `${Math.max(2, section.name.length + 1)}ch` }}
+                  type="text"
+                  value={section.name}
+                />
+                <small>
+                  {section.editor.systems.length} bar{section.editor.systems.length === 1 ? "" : "s"}
+                </small>
+              </button>
               <div className="arrangement-mode-switch" aria-label="Section print mode">
                 <button
+                  aria-label="Hands mode"
                   className={section.editor.displayMode === DISPLAY_MODES.hands ? "is-selected" : ""}
                   onClick={() => onSectionModeChange(section.id, DISPLAY_MODES.hands)}
+                  title="Hands"
                   type="button"
                 >
-                  Hands
+                  H
                 </button>
                 <button
+                  aria-label="Rhythm mode"
                   className={section.editor.displayMode === DISPLAY_MODES.rhythm ? "is-selected" : ""}
                   onClick={() => onSectionModeChange(section.id, DISPLAY_MODES.rhythm)}
+                  title="Rhythm"
                   type="button"
                 >
-                  Rhythm
+                  R
                 </button>
               </div>
-              <div className="arrangement-actions">
-                <ToolbarButton disabled={index === 0} onClick={() => onMove(section.id, -1)}>Up</ToolbarButton>
-                <ToolbarButton disabled={index === sections.length - 1} onClick={() => onMove(section.id, 1)}>
-                  Down
-                </ToolbarButton>
-                <ToolbarButton onClick={() => onLoad(section)}>Edit</ToolbarButton>
-                <ToolbarButton onClick={() => onDuplicate(section.id)}>Copy</ToolbarButton>
-                <ToolbarButton onClick={() => onRemove(section.id)}>Delete</ToolbarButton>
-              </div>
+              <button
+                aria-label={`Move ${section.name} up`}
+                className="library-icon-button arrangement-up"
+                disabled={index === 0}
+                onClick={() => onMove(section.id, -1)}
+                title="Move up"
+                type="button"
+              >
+                ↑
+              </button>
+              <button
+                aria-label={`Move ${section.name} down`}
+                className="library-icon-button arrangement-down"
+                disabled={index === sections.length - 1}
+                onClick={() => onMove(section.id, 1)}
+                title="Move down"
+                type="button"
+              >
+                ↓
+              </button>
+              <button
+                aria-label={`Delete ${section.name}`}
+                className="library-icon-button arrangement-remove"
+                onClick={() => onRemove(section.id)}
+                title="Delete"
+                type="button"
+              >
+                ×
+              </button>
             </div>
           ))
         )}
@@ -1199,6 +2009,68 @@ function getScaleLabel(editor) {
   return SCALE_PRESETS[editor?.scalePresetKey]?.label || "";
 }
 
+function SvgNoteLabelPart({ part, x, y, fontSize, anchor = "middle" }) {
+  if (!part?.text) return null;
+  const marker = part.marker === "up" ? "↑" : part.marker === "down" ? "↓" : "";
+  return (
+    <g>
+      <text
+        dominantBaseline="middle"
+        fill="#ffffff"
+        fontFamily="MyriadProSemibold, Myriad Pro, Arial, sans-serif"
+        fontSize={fontSize}
+        fontWeight="600"
+        textAnchor={anchor}
+        x={x}
+        y={y}
+      >
+        {part.text}
+      </text>
+      {marker ? (
+        <text
+          dominantBaseline="middle"
+          fill="#ffffff"
+          fontFamily="MyriadProSemibold, Myriad Pro, Arial, sans-serif"
+          fontSize={fontSize * 0.42}
+          fontWeight="600"
+          textAnchor="middle"
+          x={x + fontSize * 0.48}
+          y={part.marker === "down" ? y + fontSize * 0.42 : y - fontSize * 0.48}
+        >
+          {marker}
+        </text>
+      ) : null}
+    </g>
+  );
+}
+
+function SvgCellNoteLabel({ cell, fontSize, labelInfo, x, y }) {
+  const parts = labelInfo?.parts || [];
+  if (!labelInfo?.text || !parts.length) return null;
+  if (parts.length >= 2) {
+    const comboLayout = getComboNoteLabelLayout({ cell, noteFont: fontSize }, labelInfo);
+    return (
+      <g>
+        <SvgNoteLabelPart anchor="start" fontSize={comboLayout.topFont} part={parts[0]} x={x + comboLayout.topX} y={y + comboLayout.topY} />
+        <text
+          dominantBaseline="middle"
+          fill="#ffffff"
+          fontFamily="MyriadProSemibold, Myriad Pro, Arial, sans-serif"
+          fontSize={comboLayout.plusFont}
+          fontWeight="600"
+          textAnchor="middle"
+          x={x + cell / 2}
+          y={y + cell / 2 + 1}
+        >
+          +
+        </text>
+        <SvgNoteLabelPart anchor="end" fontSize={comboLayout.bottomFont} part={parts[1]} x={x + comboLayout.bottomX} y={y + comboLayout.bottomY} />
+      </g>
+    );
+  }
+  return <SvgNoteLabelPart fontSize={fontSize} part={parts[0]} x={x + cell / 2} y={y + cell / 2 + 3} />;
+}
+
 function MiniNotationBar({
   activeNote,
   arrangementSelection,
@@ -1214,8 +2086,15 @@ function MiniNotationBar({
   y,
   width,
 }) {
-  const { cell, gap, headerHeight, rowGap } = PRINT_BAR;
-  const gridWidth = STEP_LABELS.length * cell + (STEP_LABELS.length - 1) * gap;
+  const { headerHeight, rowGap } = PRINT_BAR;
+  const gap = PRINT_BAR.gap;
+  const systemIndex = bar.systemIndex || 0;
+  const stepLabels = getSystemStepLabels(editor, systemIndex);
+  const subdivisions = getSystemSubdivisions(editor, systemIndex);
+  const baseSubdivision = getBaseSubdivision(editor);
+  const stepCount = stepLabels.length;
+  const cell = Math.min(PRINT_BAR.cell, (width - (stepCount - 1) * gap) / stepCount);
+  const gridWidth = stepCount * cell + (stepCount - 1) * gap;
   const gridX = x + (width - gridWidth) / 2;
   const isRhythm = editor.displayMode === DISPLAY_MODES.rhythm;
   const visibleRows = isRhythm ? [0] : HAND_LABELS.map((_, index) => index);
@@ -1224,12 +2103,14 @@ function MiniNotationBar({
 
   return (
     <g>
-      {STEP_LABELS.map((label, stepIndex) => {
+      {stepLabels.map((label, stepIndex) => {
         const stepX = gridX + stepIndex * (cell + gap);
+        const beatIndex = getStepBeatIndex(editor, systemIndex, stepIndex);
+        const subdivisionClass = getSubdivisionClass(subdivisions[beatIndex], baseSubdivision);
         return (
           <text
             dominantBaseline="middle"
-            fill="#111111"
+            fill={subdivisionClass ? "#555555" : "#111111"}
             fontFamily="MyriadProRegular, Myriad Pro, Arial, sans-serif"
             fontSize={label === "&" ? 19 : 27}
             key={`step-${stepIndex}`}
@@ -1245,18 +2126,22 @@ function MiniNotationBar({
         const rowY = y + headerHeight + visibleRowIndex * (cell + rowGap);
         return (
           <g key={`row-${rowIndex}`}>
-            {STEP_LABELS.map((_, stepIndex) => {
-              const note = system[rowIndex]?.[stepIndex] || "";
+            {stepLabels.map((_, stepIndex) => {
+              const note = getVisibleCellNote(system, rowIndex, stepIndex, editor.displayMode);
               const remapped = remapNoteToScale(note, sourceNoteNameMap, editor.noteNameMap);
               const displayNote = remapped.note;
-              const label = remapped.missing
-                ? "!"
-                : getDisplayNoteLabel(displayNote, editor);
+              const labelInfo = remapped.missing
+                ? { text: "!", parts: [{ text: "!", marker: "" }] }
+                : getDisplayNoteLabelInfo(displayNote, editor);
+              const label = labelInfo.text;
               const noteFont = Math.min(30, getNoteLabelFontSize({ noteFont: 36, comboFont: 23 }, label, editor.labelMode));
               const stepX = gridX + stepIndex * (cell + gap);
+              const beatIndex = getStepBeatIndex(editor, systemIndex, stepIndex);
+              const subdivisionClass = getSubdivisionClass(subdivisions[beatIndex], baseSubdivision);
+              const alternateQuarter = editor.resolution >= 16 && beatIndex % 2 === 1;
               const isPlayingCell = isPlayingSystem && playhead?.rowIndex === rowIndex && playhead?.stepIndex === stepIndex;
               const cellRef = { sectionId, systemIndex: bar.systemIndex, rowIndex, stepIndex };
-              const selected = isArrangementCellInSelection(cellRef, arrangementSelection);
+              const selected = isArrangementCellInSelection(cellRef, arrangementSelection, stepCount);
               return (
                 <g
                   key={`cell-${stepIndex}`}
@@ -1267,7 +2152,7 @@ function MiniNotationBar({
                 >
                   <rect
                     data-a4-cell="1"
-                    fill={remapped.missing ? "#d56b5f" : note ? COLORS.noteCell : "#d9d9d9"}
+                    fill={remapped.missing ? "#d56b5f" : note ? COLORS.noteCell : subdivisionClass ? "#cfcfcf" : alternateQuarter ? "#d4d4d4" : "#d9d9d9"}
                     height={cell}
                     stroke={isPlayingCell ? "#ff6f3c" : selected ? "#8f8f8f" : "transparent"}
                     strokeWidth={isPlayingCell ? 5 : selected ? 4 : 0}
@@ -1281,18 +2166,7 @@ function MiniNotationBar({
                     </title>
                   ) : null}
                   {remapped.missing || (note && editor.showNoteLabels) ? (
-                    <text
-                      dominantBaseline="middle"
-                      fill="#ffffff"
-                      fontFamily="MyriadProSemibold, Myriad Pro, Arial, sans-serif"
-                      fontSize={noteFont}
-                      fontWeight="600"
-                      textAnchor="middle"
-                      x={stepX + cell / 2}
-                      y={rowY + cell / 2 + 3}
-                    >
-                      {label}
-                    </text>
+                    <SvgCellNoteLabel cell={cell} fontSize={noteFont} labelInfo={labelInfo} x={stepX} y={rowY} />
                   ) : null}
                 </g>
               );
@@ -1513,15 +2387,24 @@ export default function App() {
   const [arrangementSections, setArrangementSections] = React.useState(initialArrangement.sections);
   const [previewMode, setPreviewMode] = React.useState(PREVIEW_MODES.editor);
   const [playbackSettings, setPlaybackSettings] = React.useState(readPlaybackSettings);
+  const [rowSpacingDefaults, setRowSpacingDefaults] = React.useState(readRowSpacingDefaults);
   const [isPlaying, setIsPlaying] = React.useState(false);
   const [playheadStep, setPlayheadStep] = React.useState(null);
   const [arrangementPlayhead, setArrangementPlayhead] = React.useState(null);
   const [transportMenuOpen, setTransportMenuOpen] = React.useState(false);
+  const [shareMenuOpen, setShareMenuOpen] = React.useState(false);
+  const [preferencesOpen, setPreferencesOpen] = React.useState(false);
+  const [preferencesTab, setPreferencesTab] = React.useState("defaults");
+  const [legalOpen, setLegalOpen] = React.useState(false);
   const [exportStatus, setExportStatus] = React.useState("");
   const [selection, setSelection] = React.useState(null);
   const [arrangementSelection, setArrangementSelection] = React.useState(null);
   const [switchHandsMode, setSwitchHandsMode] = React.useState(false);
   const [noteListenMode, setNoteListenMode] = React.useState(false);
+  const [sidebarTab, setSidebarTab] = React.useState(null);
+  const [editorGridLeft, setEditorGridLeft] = React.useState(null);
+  const [previewNoteRequest, setPreviewNoteRequest] = React.useState(null);
+  const [subdivisionPopover, setSubdivisionPopover] = React.useState(null);
   const editorRef = React.useRef(editor);
   const arrangementSectionsRef = React.useRef(arrangementSections);
   const arrangementScalePresetRef = React.useRef(arrangementScalePresetKey);
@@ -1563,6 +2446,10 @@ export default function App() {
   const suppressNextClickRef = React.useRef(false);
   const suppressNextArrangementClickRef = React.useRef(false);
   const suppressNextPreviewClearRef = React.useRef(false);
+  const countHoldRef = React.useRef({
+    timer: null,
+    opened: false,
+  });
 
   React.useEffect(() => {
     editorRef.current = editor;
@@ -1593,6 +2480,10 @@ export default function App() {
     playbackSettingsRef.current = playbackSettings;
     writeJson(PLAYBACK_STORAGE_KEY, playbackSettings);
   }, [playbackSettings]);
+
+  React.useEffect(() => {
+    writeJson(ROW_SPACING_DEFAULTS_STORAGE_KEY, rowSpacingDefaults);
+  }, [rowSpacingDefaults]);
 
   React.useEffect(() => {
     writeJson(ARRANGEMENT_STORAGE_KEY, {
@@ -1667,6 +2558,8 @@ export default function App() {
         suppressNextClickRef.current = false;
         return;
       }
+      let noteToPreview = "";
+      let noteNameMapForPreview = null;
       commitEditor((draft) => {
         if (switchHandsMode && draft.displayMode === DISPLAY_MODES.hands) {
           const system = draft.systems[systemIndex];
@@ -1674,37 +2567,56 @@ export default function App() {
           [system[0][stepIndex], system[1][stepIndex]] = [system[1][stepIndex], system[0][stepIndex]];
           return draft;
         }
-        const current = draft.systems[systemIndex]?.[rowIndex]?.[stepIndex] || "";
-        draft.systems[systemIndex][rowIndex][stepIndex] =
-          activeNote && current !== activeNote ? activeNote : "";
+        const current = getVisibleCellNote(draft.systems[systemIndex], rowIndex, stepIndex, draft.displayMode);
+        const nextNote = activeNote && current !== activeNote ? activeNote : "";
+        if (draft.displayMode === DISPLAY_MODES.rhythm) {
+          draft.systems[systemIndex][0][stepIndex] = nextNote;
+          draft.systems[systemIndex][1][stepIndex] = "";
+        } else {
+          draft.systems[systemIndex][rowIndex][stepIndex] = nextNote;
+        }
+        if (nextNote) {
+          noteToPreview = nextNote;
+          noteNameMapForPreview = draft.noteNameMap;
+        }
         return draft;
       });
+      if (noteListenMode && noteToPreview) {
+        setPreviewNoteRequest({ id: performance.now(), note: noteToPreview, noteNameMap: noteNameMapForPreview });
+      }
     },
-    [activeNote, commitEditor, switchHandsMode]
+    [activeNote, commitEditor, noteListenMode, switchHandsMode]
   );
 
   const selectEditorRow = React.useCallback((systemIndex, rowIndex) => {
-    const stepStart = systemIndex * STEP_LABELS.length;
+    const stepCount = getStepCount(editorRef.current);
+    const stepStart = systemIndex * stepCount;
     setSelection({
       rowStart: rowIndex,
       rowEnd: rowIndex,
       stepStart,
-      stepEnd: stepStart + STEP_LABELS.length - 1,
+      stepEnd: stepStart + stepCount - 1,
     });
   }, []);
 
   const setCellToNote = React.useCallback(
     (cell, note) => {
       if (!cell || !note) return;
+      let noteNameMapForPreview = null;
       commitEditor((draft) => {
         const system = draft.systems[cell.systemIndex];
-        const row = system?.[cell.rowIndex];
-        if (!row || cell.stepIndex < 0 || cell.stepIndex >= row.length) return draft;
-        row[cell.stepIndex] = note;
+        const targetRow = draft.displayMode === DISPLAY_MODES.rhythm ? system?.[0] : system?.[cell.rowIndex];
+        if (!targetRow || cell.stepIndex < 0 || cell.stepIndex >= targetRow.length) return draft;
+        targetRow[cell.stepIndex] = note;
+        if (draft.displayMode === DISPLAY_MODES.rhythm && system?.[1]) system[1][cell.stepIndex] = "";
+        noteNameMapForPreview = draft.noteNameMap;
         return draft;
       });
+      if (noteListenMode) {
+        setPreviewNoteRequest({ id: performance.now(), note, noteNameMap: noteNameMapForPreview });
+      }
     },
-    [commitEditor]
+    [commitEditor, noteListenMode]
   );
 
   React.useEffect(() => {
@@ -1725,11 +2637,12 @@ export default function App() {
     const selected = selectionRef.current;
     const source = editorRef.current;
     if (!selected || !source?.systems?.length) return;
+    const stepCount = getStepCount(source);
     const rows = [];
     for (let row = selected.rowStart; row <= selected.rowEnd; row += 1) {
       const values = [];
       for (let absoluteStep = selected.stepStart; absoluteStep <= selected.stepEnd; absoluteStep += 1) {
-        const cell = getCellFromAbsoluteStep(absoluteStep, row);
+        const cell = getCellFromAbsoluteStep(absoluteStep, row, stepCount);
         values.push(source.systems[cell.systemIndex]?.[cell.rowIndex]?.[cell.stepIndex] || "");
       }
       rows.push(values);
@@ -1745,13 +2658,14 @@ export default function App() {
     const target = hoveredCellRef.current;
     const copied = clipboardRef.current;
     if (!target || !copied?.rows?.length) return;
-    const targetStartStep = getAbsoluteStep(target);
+    const stepCount = getStepCount(editorRef.current);
+    const targetStartStep = getAbsoluteStep(target, stepCount);
     commitEditor((draft) => {
       copied.rows.forEach((rowValues, rowOffset) => {
         const targetRowIndex = target.rowIndex + rowOffset;
         if (targetRowIndex < 0 || targetRowIndex >= HAND_LABELS.length) return;
         rowValues.forEach((value, colOffset) => {
-          const targetCell = getCellFromAbsoluteStep(targetStartStep + colOffset, targetRowIndex);
+          const targetCell = getCellFromAbsoluteStep(targetStartStep + colOffset, targetRowIndex, stepCount);
           const targetRow = draft.systems[targetCell.systemIndex]?.[targetCell.rowIndex];
           if (!targetRow) return;
           targetRow[targetCell.stepIndex] = value || "";
@@ -1760,7 +2674,7 @@ export default function App() {
       return draft;
     });
     const pasteEndStep = targetStartStep + copied.width - 1;
-    const maxStep = editorRef.current.systems.length * STEP_LABELS.length - 1;
+    const maxStep = editorRef.current.systems.length * stepCount - 1;
     setSelection({
       rowStart: target.rowIndex,
       rowEnd: Math.min(target.rowIndex + copied.height - 1, HAND_LABELS.length - 1),
@@ -1774,11 +2688,12 @@ export default function App() {
     if (!selected) return;
     const section = arrangementSectionsRef.current.find((item) => item.id === selected.sectionId);
     if (!section?.editor?.systems?.length) return;
+    const stepCount = getStepCount(section.editor);
     const rows = [];
     for (let row = selected.rowStart; row <= selected.rowEnd; row += 1) {
       const values = [];
       for (let absoluteStep = selected.stepStart; absoluteStep <= selected.stepEnd; absoluteStep += 1) {
-        const cell = getCellFromAbsoluteStep(absoluteStep, row);
+        const cell = getCellFromAbsoluteStep(absoluteStep, row, stepCount);
         values.push(section.editor.systems[cell.systemIndex]?.[cell.rowIndex]?.[cell.stepIndex] || "");
       }
       rows.push(values);
@@ -1796,21 +2711,23 @@ export default function App() {
     const target = hoveredArrangementCellRef.current;
     const copied = clipboardRef.current;
     if (!target || !copied?.rows?.length) return;
-    const targetStartStep = getAbsoluteStep(target);
+    const targetSection = arrangementSectionsRef.current.find((item) => item.id === target.sectionId);
+    const stepCount = getStepCount(targetSection?.editor);
+    const targetStartStep = getAbsoluteStep(target, stepCount);
     let maxStep = targetStartStep;
     let nextSelection = null;
     setArrangementSections((items) =>
       items.map((section) => {
         if (section.id !== target.sectionId) return section;
         const editorCopy = cloneEditor(section.editor);
-        maxStep = Math.max(0, editorCopy.systems.length * STEP_LABELS.length - 1);
+        maxStep = Math.max(0, editorCopy.systems.length * stepCount - 1);
         copied.rows.forEach((rowValues, rowOffset) => {
           const targetRowIndex = target.rowIndex + rowOffset;
           if (targetRowIndex < 0 || targetRowIndex >= HAND_LABELS.length) return;
           rowValues.forEach((value, colOffset) => {
             const absoluteStep = targetStartStep + colOffset;
             if (absoluteStep > maxStep) return;
-            const targetCell = getCellFromAbsoluteStep(absoluteStep, targetRowIndex);
+            const targetCell = getCellFromAbsoluteStep(absoluteStep, targetRowIndex, stepCount);
             const targetRow = editorCopy.systems[targetCell.systemIndex]?.[targetCell.rowIndex];
             if (!targetRow) return;
             targetRow[targetCell.stepIndex] = value || "";
@@ -1833,9 +2750,10 @@ export default function App() {
     const selected = selectionRef.current;
     if (!selected) return;
     commitEditor((draft) => {
+      const stepCount = getStepCount(draft);
       for (let rowIndex = selected.rowStart; rowIndex <= selected.rowEnd; rowIndex += 1) {
         for (let absoluteStep = selected.stepStart; absoluteStep <= selected.stepEnd; absoluteStep += 1) {
-          const cell = getCellFromAbsoluteStep(absoluteStep, rowIndex);
+          const cell = getCellFromAbsoluteStep(absoluteStep, rowIndex, stepCount);
           const row = draft.systems[cell.systemIndex]?.[cell.rowIndex];
           if (row) row[cell.stepIndex] = "";
         }
@@ -1851,9 +2769,10 @@ export default function App() {
       items.map((section) => {
         if (section.id !== selected.sectionId) return section;
         const editorCopy = cloneEditor(section.editor);
+        const stepCount = getStepCount(editorCopy);
         for (let rowIndex = selected.rowStart; rowIndex <= selected.rowEnd; rowIndex += 1) {
           for (let absoluteStep = selected.stepStart; absoluteStep <= selected.stepEnd; absoluteStep += 1) {
-            const cell = getCellFromAbsoluteStep(absoluteStep, rowIndex);
+            const cell = getCellFromAbsoluteStep(absoluteStep, rowIndex, stepCount);
             const row = editorCopy.systems[cell.systemIndex]?.[cell.rowIndex];
             if (row) row[cell.stepIndex] = "";
           }
@@ -1917,7 +2836,7 @@ export default function App() {
       timer: window.setTimeout(() => {
         selectionGestureRef.current.active = true;
         selectionGestureRef.current.didSelect = true;
-        setSelection(normalizeSelection(cell, cell));
+        setSelection(normalizeSelection(cell, cell, getStepCount(editorRef.current)));
       }, SELECTION_HOLD_MS),
     };
   }, []);
@@ -1930,7 +2849,7 @@ export default function App() {
       if (pointedCell) hoveredCellRef.current = pointedCell;
       if (!gesture.active) return;
       if (!pointedCell) return;
-      setSelection(normalizeSelection(gesture.anchor, pointedCell));
+      setSelection(normalizeSelection(gesture.anchor, pointedCell, getStepCount(editorRef.current)));
     };
     const onPointerUp = () => {
       const gesture = selectionGestureRef.current;
@@ -1964,11 +2883,112 @@ export default function App() {
     [commitEditor]
   );
 
-  const changeDisplayMode = React.useCallback(
-    (displayMode) => {
-      commitEditor((draft) => normalizeEditorForDisplayMode(draft, displayMode));
+  const changeResolution = React.useCallback(
+    (resolution) => {
+      commitEditor((draft) => {
+        const nextDraft = { ...draft, resolution };
+        const baseSubdivision = getBaseSubdivision(nextDraft);
+        const nextSubdivisions = draft.systems.map(() => Array.from({ length: nextDraft.timeSig.n }, () => baseSubdivision));
+        nextDraft.systems = draft.systems.map((system, systemIndex) =>
+          remapSystemToSubdivisions(system, draft.subdivisions[systemIndex], nextSubdivisions[systemIndex])
+        );
+        nextDraft.subdivisions = nextSubdivisions;
+        return nextDraft;
+      });
+      setSelection(null);
+      setArrangementSelection(null);
     },
     [commitEditor]
+  );
+
+  const changeTimeSignature = React.useCallback(
+    (timeSig) => {
+      commitEditor((draft) => {
+        const nextDraft = { ...draft, timeSig };
+        const baseSubdivision = getBaseSubdivision(nextDraft);
+        const nextSubdivisions = draft.systems.map(() => Array.from({ length: nextDraft.timeSig.n }, () => baseSubdivision));
+        nextDraft.systems = draft.systems.map((system, systemIndex) =>
+          remapSystemToSubdivisions(system, draft.subdivisions[systemIndex], nextSubdivisions[systemIndex])
+        );
+        nextDraft.subdivisions = nextSubdivisions;
+        return nextDraft;
+      });
+      setSelection(null);
+      setArrangementSelection(null);
+    },
+    [commitEditor]
+  );
+
+  const applySubdivision = React.useCallback(
+    (systemIndex, beatIndex, subdivision = null) => {
+      if (countHoldRef.current.opened) {
+        countHoldRef.current.opened = false;
+        return;
+      }
+      commitEditor((draft) => {
+        const baseSubdivision = getBaseSubdivision(draft);
+        const nextSubdivision = subdivision || draft.lastSubdivision || 3;
+        const nextSubdivisions = draft.subdivisions.map((systemSubdivisions) => [...systemSubdivisions]);
+        const previousSystemSubdivisions = [...(nextSubdivisions[systemIndex] || [])];
+        const current = previousSystemSubdivisions[beatIndex] || baseSubdivision;
+        previousSystemSubdivisions[beatIndex] = current === nextSubdivision ? baseSubdivision : nextSubdivision;
+        nextSubdivisions[systemIndex] = previousSystemSubdivisions;
+        draft.systems[systemIndex] = remapSystemToSubdivisions(
+          draft.systems[systemIndex],
+          draft.subdivisions[systemIndex],
+          previousSystemSubdivisions
+        );
+        draft.subdivisions = nextSubdivisions;
+        if (subdivision) draft.lastSubdivision = subdivision;
+        return draft;
+      });
+      setSelection(null);
+    },
+    [commitEditor]
+  );
+
+  const openSubdivisionPopover = React.useCallback((rect, systemIndex, beatIndex) => {
+    setSubdivisionPopover({
+      systemIndex,
+      beatIndex,
+      x: rect.left + rect.width / 2,
+      y: rect.bottom + 8,
+    });
+  }, []);
+
+  const handleCountPointerDown = React.useCallback((event, systemIndex, beatIndex) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    if (countHoldRef.current.timer) window.clearTimeout(countHoldRef.current.timer);
+    countHoldRef.current.opened = false;
+    countHoldRef.current.timer = window.setTimeout(() => {
+      countHoldRef.current.opened = true;
+      openSubdivisionPopover(rect, systemIndex, beatIndex);
+    }, COUNT_HOLD_MS);
+  }, [openSubdivisionPopover]);
+
+  const handleCountPointerUp = React.useCallback(() => {
+    if (countHoldRef.current.timer) window.clearTimeout(countHoldRef.current.timer);
+    countHoldRef.current.timer = null;
+  }, []);
+
+  const chooseSubdivision = React.useCallback(
+    (value) => {
+      if (!subdivisionPopover) return;
+      countHoldRef.current.opened = false;
+      applySubdivision(subdivisionPopover.systemIndex, subdivisionPopover.beatIndex, value);
+      setSubdivisionPopover(null);
+    },
+    [applySubdivision, subdivisionPopover]
+  );
+
+  const changeDisplayMode = React.useCallback(
+    (displayMode) => {
+      commitEditor((draft) => ({
+        ...normalizeEditorForDisplayMode(draft, displayMode),
+        systemSpacing: rowSpacingDefaults[displayMode] ?? DEFAULT_ROW_SPACING_BY_MODE[displayMode],
+      }));
+    },
+    [commitEditor, rowSpacingDefaults]
   );
 
   const changeHandLabelLanguage = React.useCallback(
@@ -1981,6 +3001,20 @@ export default function App() {
   const changeLabelMode = React.useCallback(
     (labelMode) => {
       commitEditor((draft) => ({ ...draft, labelMode }));
+    },
+    [commitEditor]
+  );
+
+  const changeLabelDisplayMode = React.useCallback(
+    (labelMode) => {
+      commitEditor((draft) => {
+        const hideLabels = draft.showNoteLabels && draft.labelMode === labelMode;
+        return {
+          ...draft,
+          labelMode,
+          showNoteLabels: !hideLabels,
+        };
+      });
     },
     [commitEditor]
   );
@@ -2005,6 +3039,16 @@ export default function App() {
     [commitEditor]
   );
 
+  const stepScalePreset = React.useCallback(
+    (direction) => {
+      const presets = Object.values(SCALE_PRESETS);
+      const currentIndex = Math.max(0, presets.findIndex((preset) => preset.key === editorRef.current.scalePresetKey));
+      const nextIndex = (currentIndex + direction + presets.length) % presets.length;
+      changeScalePreset(presets[nextIndex].key);
+    },
+    [changeScalePreset]
+  );
+
   const changeNoteName = React.useCallback(
     (note, value) => {
       commitEditor((draft) => ({
@@ -2025,7 +3069,36 @@ export default function App() {
     [commitEditor]
   );
 
+  const changeRowSpacingDefault = React.useCallback((displayMode, value) => {
+    const nextValue = clampNumber(value, SYSTEM_SPACING.min, SYSTEM_SPACING.max, DEFAULT_ROW_SPACING_BY_MODE[displayMode]);
+    setRowSpacingDefaults((current) => ({
+      ...current,
+      [displayMode]: nextValue,
+    }));
+    if (editorRef.current.displayMode === displayMode) {
+      commitEditor((draft) => ({ ...draft, systemSpacing: nextValue }));
+    }
+  }, [commitEditor]);
+
+  const changeBarsInRow = React.useCallback(
+    (barsInRow) => {
+      const nextBarsInRow = Math.max(
+        BARS_IN_ROW.min,
+        Math.min(BARS_IN_ROW.max, Math.round(Number(barsInRow) || BARS_IN_ROW.defaultValue))
+      );
+      commitEditor((draft) => ({ ...draft, barsInRow: nextBarsInRow }));
+    },
+    [commitEditor]
+  );
+
   const changeVisibility = React.useCallback(
+    (key, value) => {
+      commitEditor((draft) => ({ ...draft, [key]: value }));
+    },
+    [commitEditor]
+  );
+
+  const changePreviewTuning = React.useCallback(
     (key, value) => {
       commitEditor((draft) => ({ ...draft, [key]: value }));
     },
@@ -2034,7 +3107,10 @@ export default function App() {
 
   const addSystem = React.useCallback(() => {
     commitEditor((draft) => {
-      draft.systems.push(createEmptySystem());
+      const baseSubdivision = getBaseSubdivision(draft);
+      const subdivisions = Array.from({ length: draft.timeSig.n }, () => baseSubdivision);
+      draft.subdivisions.push(subdivisions);
+      draft.systems.push(createEmptySystem(subdivisions.reduce((sum, value) => sum + value, 0)));
       return draft;
     });
   }, [commitEditor]);
@@ -2042,6 +3118,7 @@ export default function App() {
   const removeSystem = React.useCallback(() => {
     commitEditor((draft) => {
       if (draft.systems.length > 1) draft.systems.pop();
+      if (draft.subdivisions.length > 1) draft.subdivisions.pop();
       return draft;
     });
   }, [commitEditor]);
@@ -2049,16 +3126,9 @@ export default function App() {
   const clearPattern = React.useCallback(() => {
     commitEditor((draft) => ({
       ...draft,
-      systems: draft.systems.map(() => createEmptySystem()),
+      systems: draft.systems.map((_, systemIndex) => createEmptySystem(getSystemStepCount(draft, systemIndex))),
     }));
   }, [commitEditor]);
-
-  const loadSample = React.useCallback(
-    (sample) => {
-      commitEditor(() => sample());
-    },
-    [commitEditor]
-  );
 
   const savePattern = React.useCallback(() => {
     const name = title.trim() || "Untitled";
@@ -2152,6 +3222,8 @@ export default function App() {
       suppressNextArrangementClickRef.current = false;
       return;
     }
+    let noteToPreview = "";
+    let noteNameMapForPreview = null;
     setArrangementSections((items) =>
       items.map((section) => {
         if (section.id !== sectionId) return section;
@@ -2162,17 +3234,30 @@ export default function App() {
           [system[0][stepIndex], system[1][stepIndex]] = [system[1][stepIndex], system[0][stepIndex]];
           return { ...section, editor: editorCopy };
         }
-        const current = editorCopy.systems[systemIndex]?.[rowIndex]?.[stepIndex] || "";
-        if (!editorCopy.systems[systemIndex]?.[rowIndex]) return section;
+        const targetRow = editorCopy.displayMode === DISPLAY_MODES.rhythm
+          ? editorCopy.systems[systemIndex]?.[0]
+          : editorCopy.systems[systemIndex]?.[rowIndex];
+        if (!targetRow) return section;
+        const current = getVisibleCellNote(editorCopy.systems[systemIndex], rowIndex, stepIndex, editorCopy.displayMode);
         const arrangementNoteNameMap = normalizeNoteNameMap(null, arrangementScalePresetRef.current);
         const sourceNote = mapNoteBetweenScales(activeNote, arrangementNoteNameMap, editorCopy.noteNameMap);
         const currentArrangementNote = mapNoteBetweenScales(current, editorCopy.noteNameMap, arrangementNoteNameMap);
-        editorCopy.systems[systemIndex][rowIndex][stepIndex] =
-          sourceNote && currentArrangementNote !== activeNote ? sourceNote : "";
+        const nextNote = sourceNote && currentArrangementNote !== activeNote ? sourceNote : "";
+        targetRow[stepIndex] = nextNote;
+        if (editorCopy.displayMode === DISPLAY_MODES.rhythm && editorCopy.systems[systemIndex]?.[1]) {
+          editorCopy.systems[systemIndex][1][stepIndex] = "";
+        }
+        if (nextNote) {
+          noteToPreview = nextNote;
+          noteNameMapForPreview = editorCopy.noteNameMap;
+        }
         return { ...section, editor: editorCopy };
       })
     );
-  }, [activeNote, switchHandsMode]);
+    if (noteListenMode && noteToPreview) {
+      setPreviewNoteRequest({ id: performance.now(), note: noteToPreview, noteNameMap: noteNameMapForPreview });
+    }
+  }, [activeNote, noteListenMode, switchHandsMode]);
 
   const handleArrangementCellPointerDown = React.useCallback((event, cell) => {
     if (event.button != null && event.button !== 0) return;
@@ -2189,7 +3274,8 @@ export default function App() {
     hoveredArrangementCellRef.current = cell;
     const gesture = arrangementSelectionGestureRef.current;
     if (!gesture.active || !gesture.anchor) return;
-    const nextSelection = normalizeArrangementSelection(gesture.anchor, cell);
+    const section = arrangementSectionsRef.current.find((item) => item.id === cell.sectionId);
+    const nextSelection = normalizeArrangementSelection(gesture.anchor, cell, getStepCount(section?.editor));
     if (!nextSelection) return;
     gesture.didSelect = true;
     setArrangementSelection(nextSelection);
@@ -2217,31 +3303,19 @@ export default function App() {
   }, []);
 
   const selectArrangementRow = React.useCallback((sectionId, startSystemIndex, endSystemIndex, rowIndex) => {
+    const section = arrangementSectionsRef.current.find((item) => item.id === sectionId);
+    const stepCount = getStepCount(section?.editor);
     setArrangementSelection({
       sectionId,
       rowStart: rowIndex,
       rowEnd: rowIndex,
-      stepStart: startSystemIndex * STEP_LABELS.length,
-      stepEnd: endSystemIndex * STEP_LABELS.length + STEP_LABELS.length - 1,
+      stepStart: startSystemIndex * stepCount,
+      stepEnd: endSystemIndex * stepCount + stepCount - 1,
     });
   }, []);
 
   const removeArrangementSection = React.useCallback((id) => {
     setArrangementSections((items) => items.filter((section) => section.id !== id));
-  }, []);
-
-  const duplicateArrangementSection = React.useCallback((id) => {
-    setArrangementSections((items) => {
-      const index = items.findIndex((section) => section.id === id);
-      if (index < 0) return items;
-      const copy = {
-        ...items[index],
-        id: makeId(),
-        name: `${items[index].name} copy`,
-        editor: cloneEditor(items[index].editor),
-      };
-      return [...items.slice(0, index + 1), copy, ...items.slice(index + 1)].slice(0, 80);
-    });
   }, []);
 
   const moveArrangementSection = React.useCallback((id, direction) => {
@@ -2403,6 +3477,7 @@ export default function App() {
     if (audio.timeout) window.clearTimeout(audio.timeout);
     audio.interval = null;
     audio.timeout = null;
+    audio.running = false;
     audio.step = 0;
     setIsPlaying(false);
     setPlayheadStep(null);
@@ -2411,10 +3486,13 @@ export default function App() {
 
   const playPlaybackStep = React.useCallback(async () => {
     const audio = audioRef.current;
+    const settings = playbackSettingsRef.current;
+    const effectiveBpm = Math.max(20, settings.bpm * settings.playbackRate);
+    let nextDelay = 60_000 / effectiveBpm;
     if (previewModeRef.current === PREVIEW_MODES.print && arrangementSectionsRef.current.length) {
       const entries = arrangementSectionsRef.current.flatMap((section) =>
         section.editor.systems.flatMap((system, systemIndex) =>
-          STEP_LABELS.map((_, stepIndex) => ({ section, system, systemIndex, stepIndex }))
+          getSystemStepLabels(section.editor, systemIndex).map((_, stepIndex) => ({ section, system, systemIndex, stepIndex }))
         )
       );
       if (!entries.length) {
@@ -2422,6 +3500,7 @@ export default function App() {
         return;
       }
       const entry = entries[audio.step % entries.length];
+      nextDelay = getStepDurationMs(entry.section.editor, entry.systemIndex, entry.stepIndex, effectiveBpm);
       setPlayheadStep(null);
       setArrangementPlayhead({
         sectionId: entry.section.id,
@@ -2429,14 +3508,16 @@ export default function App() {
         rowIndex: entry.section.editor.displayMode === DISPLAY_MODES.rhythm ? 0 : -1,
         stepIndex: entry.stepIndex,
       });
-      if (playbackSettingsRef.current.metronomeEnabled && entry.stepIndex % 2 === 0) {
-        playMetronomeClick(entry.stepIndex === 0);
+      const currentBeat = getStepBeatIndex(entry.section.editor, entry.systemIndex, entry.stepIndex);
+      const previousBeat = entry.stepIndex > 0 ? getStepBeatIndex(entry.section.editor, entry.systemIndex, entry.stepIndex - 1) : -1;
+      if (settings.metronomeEnabled && currentBeat !== previousBeat) {
+        playMetronomeClick(currentBeat === 0);
       }
       let firstPlayedRow = null;
       const targetMap = normalizeNoteNameMap(null, arrangementScalePresetRef.current);
       const playbackRows =
         entry.section.editor.displayMode === DISPLAY_MODES.rhythm
-          ? [0]
+          ? HAND_LABELS.map((_, rowIndex) => rowIndex)
           : HAND_LABELS.map((_, rowIndex) => rowIndex);
       playbackRows.forEach((rowIndex) => {
         const row = entry.system[rowIndex];
@@ -2456,32 +3537,34 @@ export default function App() {
         stepIndex: entry.stepIndex,
       });
       audio.step += 1;
+      if (audio.running) audio.timeout = window.setTimeout(playPlaybackStep, nextDelay);
       return;
     }
 
     const current = editorRef.current;
-    const totalSteps = current.systems.length * STEP_LABELS.length;
-    if (totalSteps < 1) {
+    const entries = current.systems.flatMap((system, systemIndex) =>
+      getSystemStepLabels(current, systemIndex).map((_, stepIndex) => ({ system, systemIndex, stepIndex }))
+    );
+    if (!entries.length) {
       stopPlayback();
       return;
     }
-    const absoluteStep = audio.step % totalSteps;
-    const systemIndex = Math.floor(absoluteStep / STEP_LABELS.length);
-    const stepIndex = absoluteStep % STEP_LABELS.length;
-    setPlayheadStep(absoluteStep);
+    const entry = entries[audio.step % entries.length];
+    const { system, systemIndex, stepIndex } = entry;
+    nextDelay = getStepDurationMs(current, systemIndex, stepIndex, effectiveBpm);
+    setPlayheadStep({ systemIndex, stepIndex });
     setArrangementPlayhead(null);
-    if (playbackSettingsRef.current.metronomeEnabled && stepIndex % 2 === 0) {
-      playMetronomeClick(stepIndex === 0);
+    const currentBeat = getStepBeatIndex(current, systemIndex, stepIndex);
+    const previousBeat = stepIndex > 0 ? getStepBeatIndex(current, systemIndex, stepIndex - 1) : -1;
+    if (settings.metronomeEnabled && currentBeat !== previousBeat) {
+      playMetronomeClick(currentBeat === 0);
     }
-    const editorPlaybackRows =
-      current.displayMode === DISPLAY_MODES.rhythm
-        ? [current.systems[systemIndex]?.[0]]
-        : current.systems[systemIndex];
-    editorPlaybackRows?.forEach((row) => {
+    system?.forEach((row) => {
       const note = row?.[stepIndex] || "";
       if (note) playHandpanTone(note, null, current.noteNameMap);
     });
     audio.step += 1;
+    if (audio.running) audio.timeout = window.setTimeout(playPlaybackStep, nextDelay);
   }, [playHandpanTone, playMetronomeClick, stopPlayback]);
 
   const startPlayback = React.useCallback(async () => {
@@ -2489,12 +3572,11 @@ export default function App() {
     await loadMetronomeBuffers();
     const settings = playbackSettingsRef.current;
     const effectiveBpm = Math.max(20, settings.bpm * settings.playbackRate);
-    const stepMs = (60_000 / effectiveBpm) / 2;
     const begin = () => {
       setIsPlaying(true);
+      audioRef.current.running = true;
       audioRef.current.step = 0;
       playPlaybackStep();
-      audioRef.current.interval = window.setInterval(playPlaybackStep, stepMs);
     };
     if (settings.countInEnabled) {
       const beatMs = 60_000 / effectiveBpm;
@@ -2509,20 +3591,27 @@ export default function App() {
     }
   }, [loadMetronomeBuffers, playMetronomeClick, playPlaybackStep, stopPlayback]);
 
-  React.useEffect(() => {
-    const audio = audioRef.current;
-    if (!isPlaying || !audio.interval) return undefined;
-    const effectiveBpm = Math.max(20, playbackSettings.bpm * playbackSettings.playbackRate);
-    const stepMs = (60_000 / effectiveBpm) / 2;
-    window.clearInterval(audio.interval);
-    audio.interval = window.setInterval(playPlaybackStep, stepMs);
-    return undefined;
-  }, [isPlaying, playbackSettings.bpm, playbackSettings.playbackRate, playPlaybackStep]);
-
   const togglePlayback = React.useCallback(() => {
     if (isPlaying) stopPlayback();
     else startPlayback();
   }, [isPlaying, startPlayback, stopPlayback]);
+
+  React.useEffect(() => {
+    if (!previewNoteRequest?.note) return;
+    playHandpanTone(previewNoteRequest.note, null, previewNoteRequest.noteNameMap);
+  }, [playHandpanTone, previewNoteRequest]);
+
+  React.useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (isTextEntryTarget(event.target)) return;
+      if (event.code !== "Space" && event.key !== " ") return;
+      event.preventDefault();
+      togglePlayback();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [togglePlayback]);
 
   const handleTapTempo = React.useCallback(() => {
     const now = performance.now();
@@ -2554,20 +3643,38 @@ export default function App() {
     }
   }, [title]);
 
+  const toggleSidebarTab = React.useCallback((tab) => {
+    setPreviewMode(tab === SIDEBAR_TABS.a4 ? PREVIEW_MODES.print : PREVIEW_MODES.editor);
+    setSidebarTab((current) => (current === tab ? null : tab));
+  }, []);
+
   return (
-    <div className="app-shell">
+    <>
+    <div className={`app-shell ${previewMode === PREVIEW_MODES.print ? "is-print-mode" : "is-editor-mode"}`}>
       <TransportHeader
         bpm={playbackSettings.bpm}
+        canRedo={future.length > 0}
+        canUndo={past.length > 0}
         isPlaying={isPlaying}
         onBpmPointerDown={handleBpmScrubPointerDown}
+        onRedo={redo}
+        onShareToggle={() => setShareMenuOpen((value) => !value)}
         onSettingsToggle={() => {
           if (performance.now() < bpmClickSuppressUntilRef.current) return;
           setTransportMenuOpen((value) => !value);
         }}
-        onTapTempo={handleTapTempo}
         onTogglePlay={togglePlayback}
+        onUndo={undo}
+        shareOpen={shareMenuOpen}
         settingsOpen={transportMenuOpen}
       />
+      {shareMenuOpen ? (
+        <ShareExportPopup
+          exportStatus={exportStatus}
+          onClose={() => setShareMenuOpen(false)}
+          onExportPng={exportPng}
+        />
+      ) : null}
       {transportMenuOpen ? (
         <PlaybackSettingsPopup
           bpm={playbackSettings.bpm}
@@ -2587,133 +3694,178 @@ export default function App() {
           volume={playbackSettings.volume}
         />
       ) : null}
-      <aside className="tool-panel">
-        <div className="brand-lockup">
-          <span>Handpan</span>
-          <strong>Notation</strong>
+      {preferencesOpen ? (
+        <PreferencesDialog
+          activeTab={preferencesTab}
+          editor={editor}
+          onClose={() => setPreferencesOpen(false)}
+          onHandLabelLanguageChange={changeHandLabelLanguage}
+          onPreviewTuningChange={changePreviewTuning}
+          onRowSpacingDefaultChange={changeRowSpacingDefault}
+          onSetTab={setPreferencesTab}
+          onSystemSpacingChange={changeSystemSpacing}
+          rowSpacingDefaults={rowSpacingDefaults}
+        />
+      ) : null}
+      {legalOpen ? <LegalDialog onClose={() => setLegalOpen(false)} /> : null}
+      {subdivisionPopover ? (
+        <div
+          className="subdivision-popover"
+          style={{ left: subdivisionPopover.x, top: subdivisionPopover.y }}
+        >
+          <div className="subdivision-popover-title">Subdivision</div>
+          <div className="subdivision-options">
+            {SUBDIVISION_OPTIONS.map((value) => (
+              <button
+                className={editor.lastSubdivision === value ? "is-selected" : ""}
+                key={value}
+                onClick={() => chooseSubdivision(value)}
+                type="button"
+              >
+                {value}
+              </button>
+            ))}
+          </div>
         </div>
-
-        <section className="panel-section">
-          <label className="field-label" htmlFor="notation-title">
-            Name
-          </label>
-          <input
-            id="notation-title"
-            onChange={(event) => setTitle(event.target.value)}
-            spellCheck="false"
-            type="text"
-            value={title}
-          />
-        </section>
-
-        <section className="panel-section">
-          <div className="section-title">View</div>
-          <PreviewModeSwitch mode={previewMode} onChange={setPreviewMode} />
-        </section>
-
-        <section className="panel-section">
-          <div className="section-title">Mode</div>
-          <ModeSwitch displayMode={editor.displayMode} onChange={changeDisplayMode} />
-          <HandLanguageSwitch language={editor.handLabelLanguage} onChange={changeHandLabelLanguage} />
-        </section>
-
-        <LabelSection
-          editor={editor}
-          onLabelModeChange={changeLabelMode}
-          onOctaveModeChange={changeOctaveMode}
-        />
-
-        <ScaleSection
-          editor={editor}
-          onMapChange={changeNoteName}
-          onPresetChange={changeScalePreset}
-        />
-
-        <section className="panel-section">
-          <div className="section-title-row">
-            <div className="section-title">Notes</div>
-            <ToolbarButton
-              active={noteListenMode}
-              aria-label="Preview note sounds"
-              onClick={() => setNoteListenMode((value) => !value)}
-            >
-              Speaker
-            </ToolbarButton>
-          </div>
-          <NotePalette
-            activeNote={activeNote}
-            editor={editor}
-            listenMode={noteListenMode}
-            onPreviewNote={(note, noteNameMap) => playHandpanTone(note, null, noteNameMap)}
-            onSelectNote={setActiveNote}
-            onSwitchHandsModeChange={setSwitchHandsMode}
-            onVisibilityChange={changeVisibility}
-            switchHandsMode={switchHandsMode}
-          />
-        </section>
-
-        <section className="panel-section">
-          <div className="section-title">Grid</div>
-          <div className="button-row">
-            <ToolbarButton onClick={undo} disabled={!past.length}>Undo</ToolbarButton>
-            <ToolbarButton onClick={redo} disabled={!future.length}>Redo</ToolbarButton>
-          </div>
-          <div className="button-row">
-            <ToolbarButton onClick={addSystem}>Add line</ToolbarButton>
-            <ToolbarButton disabled={editor.systems.length <= 1} onClick={removeSystem}>
-              Remove
-            </ToolbarButton>
-          </div>
-          <div className="button-row">
-            <ToolbarButton onClick={clearPattern}>Clear</ToolbarButton>
-            <ToolbarButton onClick={() => loadSample(createSampleOne)}>Example 1</ToolbarButton>
-            <ToolbarButton onClick={() => loadSample(createSampleTwo)}>Example 2</ToolbarButton>
-          </div>
-        </section>
-
-        <section className="panel-section">
-          <div className="section-title">PNG</div>
-          <FormatSwitch formatKey={editor.formatKey} onChange={changeFormat} />
-          <SpacingSlider
-            disabled={!FORMAT_PRESETS[editor.formatKey]?.spacingAdjustable || editor.systems.length <= 1}
-            onChange={changeSystemSpacing}
-            value={editor.systemSpacing}
-          />
-          <ToolbarButton onClick={exportPng}>Export 4K PNG</ToolbarButton>
-          {exportStatus ? <div className="export-status">{exportStatus}</div> : null}
-        </section>
-
-        <ArrangementPanel
+      ) : null}
+      <div className={`workspace${sidebarTab ? " has-sidebar" : ""}`}>
+        <WorkspaceIconRail onSidebarToggle={toggleSidebarTab} sidebarTab={sidebarTab} />
+        <CanvasNameField
           arrangementTitle={arrangementTitle}
-          scalePresetKey={arrangementScalePresetKey}
-          sections={arrangementSections}
-          onAddCurrent={addCurrentToArrangement}
+          gridLeft={editorGridLeft}
+          nameFontSize={editor.previewNameFontSize}
+          nameOffsetX={editor.previewNameOffsetX}
+          nameOffsetY={editor.previewNameOffsetY}
           onArrangementTitleChange={setArrangementTitle}
-          onDuplicate={duplicateArrangementSection}
-          onLoad={loadArrangementSection}
-          onMove={moveArrangementSection}
-          onNameChange={renameArrangementSection}
-          onPrint={printArrangement}
-          onRemove={removeArrangementSection}
-          onScaleChange={(value) => setArrangementScalePresetKey(normalizeArrangementScale(value))}
-          onSectionModeChange={changeArrangementSectionMode}
+          onTitleChange={setTitle}
+          previewMode={previewMode}
+          title={title}
         />
+        <div className="workspace-scroll">
+          <div className="workspace-content">
+        {sidebarTab ? (
+        <aside className="tool-panel">
+          <div className="tool-panel-header">
+            <h2>
+              {sidebarTab === SIDEBAR_TABS.settings
+                ? "Settings"
+                : sidebarTab === SIDEBAR_TABS.notes
+                  ? "Notes"
+                  : sidebarTab === SIDEBAR_TABS.a4
+                    ? "Arrangement"
+                    : "Library"}
+            </h2>
+            <button aria-label="Close sidebar" onClick={() => setSidebarTab(null)} type="button">×</button>
+          </div>
 
-        <section className="panel-section library-section">
-          <div className="section-title">Library</div>
-          <ToolbarButton onClick={savePattern}>Save current</ToolbarButton>
-          <LibraryPanel
-            library={library}
-            onAddToArrangement={addLibraryEntryToArrangement}
-            onDelete={deletePattern}
-            onLoad={loadPattern}
-            onRename={renamePattern}
-            onUpdate={updatePattern}
-          />
-        </section>
-      </aside>
+          {sidebarTab === SIDEBAR_TABS.settings ? (
+            <div className="sidebar-tab-panel">
+              <section className="panel-section settings-mode-section">
+                <ModeSwitch displayMode={editor.displayMode} onChange={changeDisplayMode} />
+              </section>
 
-      <main className="preview-panel" onClick={clearPreviewSelection}>
+              <SettingsSteppers
+                bars={editor.systems.length}
+                barsInRow={editor.barsInRow}
+                formatKey={editor.formatKey}
+                resolution={editor.resolution}
+                timeSig={editor.timeSig}
+                onAddBar={addSystem}
+                onBarsInRowChange={changeBarsInRow}
+                onResolutionChange={changeResolution}
+                onRemoveBar={removeSystem}
+                onSetFormat={changeFormat}
+                onTimeSigChange={changeTimeSignature}
+              />
+
+              <section className="panel-section settings-actions-section">
+                <CompactScaleSlider
+                  onChange={(value) => changePreviewTuning("previewScale", value)}
+                  value={editor.previewScale}
+                />
+                <button
+                  aria-label="Clear all notes"
+                  className="settings-trash-button"
+                  onClick={clearPattern}
+                  title="Clear all notes"
+                  type="button"
+                >
+                  <TrashIcon />
+                </button>
+              </section>
+            </div>
+          ) : sidebarTab === SIDEBAR_TABS.notes ? (
+            <div className="sidebar-tab-panel">
+              <ScaleSection
+                editor={editor}
+                onMapChange={changeNoteName}
+                onPresetChange={changeScalePreset}
+              />
+
+              <LabelSection
+                editor={editor}
+                onLabelDisplayModeChange={changeLabelDisplayMode}
+                onOctaveModeChange={changeOctaveMode}
+              />
+
+              <section className="panel-section notes-palette-section">
+                <div className="note-preview-row">
+                  <ToolbarButton
+                    active={noteListenMode}
+                    aria-label="Preview note sounds"
+                    className={`toolbar-button note-preview-button${noteListenMode ? " is-active" : ""}`}
+                    onClick={() => setNoteListenMode((value) => !value)}
+                  >
+                    <VolumeIcon />
+                  </ToolbarButton>
+                </div>
+                <NotePalette
+                  activeNote={activeNote}
+                  editor={editor}
+                  listenMode={noteListenMode}
+                  onPreviewNote={(note, noteNameMap) => playHandpanTone(note, null, noteNameMap)}
+                  onSelectNote={setActiveNote}
+                  onSwitchHandsModeChange={setSwitchHandsMode}
+                  switchHandsMode={switchHandsMode}
+                />
+              </section>
+            </div>
+          ) : sidebarTab === SIDEBAR_TABS.a4 ? (
+            <div className="sidebar-tab-panel">
+              <ArrangementPanel
+                arrangementTitle={arrangementTitle}
+                scalePresetKey={arrangementScalePresetKey}
+                sections={arrangementSections}
+                onAddCurrent={addCurrentToArrangement}
+                onArrangementTitleChange={setArrangementTitle}
+                onLoad={loadArrangementSection}
+                onMove={moveArrangementSection}
+                onNameChange={renameArrangementSection}
+                onPrint={printArrangement}
+                onRemove={removeArrangementSection}
+                onScaleChange={(value) => setArrangementScalePresetKey(normalizeArrangementScale(value))}
+                onSectionModeChange={changeArrangementSectionMode}
+              />
+            </div>
+          ) : (
+            <div className="sidebar-tab-panel">
+              <section className="panel-section library-section">
+                <ToolbarButton onClick={savePattern}>Save current</ToolbarButton>
+                <LibraryPanel
+                  library={library}
+                  onAddToArrangement={addLibraryEntryToArrangement}
+                  onDelete={deletePattern}
+                  onLoad={loadPattern}
+                  onRename={renamePattern}
+                  onUpdate={updatePattern}
+                />
+              </section>
+            </div>
+          )}
+        </aside>
+        ) : null}
+
+        <main className="preview-panel" onClick={clearPreviewSelection}>
         {previewMode === PREVIEW_MODES.print ? (
           <PrintArrangementPreview
             activeNote={activeNote}
@@ -2732,16 +3884,29 @@ export default function App() {
           <NotationStage
             activeNote={activeNote}
             editor={editor}
+            onGridLeftChange={setEditorGridLeft}
             onCellClick={setCell}
             onCellPointerDown={handleCellPointerDown}
             onCellPointerEnter={handleCellPointerEnter}
+            onCountClick={applySubdivision}
+            onCountPointerDown={handleCountPointerDown}
+            onCountPointerUp={handleCountPointerUp}
             onRowLabelClick={selectEditorRow}
             playheadStep={playheadStep}
             selection={selection}
           />
         )}
-      </main>
+        </main>
+          </div>
+        </div>
+      <FooterActions
+        onLegalClick={() => setLegalOpen(true)}
+        onPreferencesClick={() => setPreferencesOpen(true)}
+      />
+      </div>
       <SiteFooter />
     </div>
+    <FooterSeoContent />
+    </>
   );
 }
