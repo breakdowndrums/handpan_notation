@@ -50,11 +50,16 @@ import {
   shouldShowCountLabels,
   splitNoteOctave,
 } from "./notationLayout.js";
+import { hasSupabaseConfig, supabase } from "./lib/supabase.js";
 
 const DRAFT_STORAGE_KEY = "handpan-notation-draft-v1";
 const LIBRARY_STORAGE_KEY = "handpan-notation-library-v1";
 const ARRANGEMENT_STORAGE_KEY = "handpan-notation-print-arrangement-v1";
 const ROW_SPACING_DEFAULTS_STORAGE_KEY = "handpan-notation-row-spacing-defaults-v1";
+const SHARE_LINK_KINDS = {
+  pattern: "handpan-notation",
+  arrangement: "handpan-arrangement",
+};
 const HISTORY_LIMIT = 120;
 const SELECTION_HOLD_MS = 260;
 const PREVIEW_MODES = {
@@ -178,6 +183,32 @@ function makeId() {
   return `handpan-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+function makeShareId() {
+  if (window.crypto?.getRandomValues) {
+    const bytes = new Uint8Array(9);
+    window.crypto.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => byte.toString(36).padStart(2, "0")).join("").slice(0, 16);
+  }
+  return Math.random().toString(36).slice(2, 18);
+}
+
+function getShareIdFromUrl() {
+  try {
+    const url = new URL(window.location.href);
+    const shareId = String(url.searchParams.get("share") || url.hash.match(/share=([^&]+)/)?.[1] || "").trim();
+    return /^[A-Za-z0-9_-]{6,64}$/.test(shareId) ? shareId : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function buildShareUrl(id) {
+  const url = new URL(window.location.href);
+  url.searchParams.set("share", id);
+  url.hash = "";
+  return url.toString();
+}
+
 function readDraft() {
   return normalizeEditor(readJson(DRAFT_STORAGE_KEY, createSampleOne()));
 }
@@ -253,6 +284,35 @@ function formatLibraryDate(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
   return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function normalizeCloudLibraryEntry(entry) {
+  return {
+    id: String(entry?.id || makeId()),
+    name: String(entry?.name || "Untitled").trim() || "Untitled",
+    updatedAt: String(entry?.updated_at || entry?.updatedAt || new Date().toISOString()),
+    editor: normalizeEditor(entry?.editor),
+  };
+}
+
+function normalizeSharedPayload(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const editor = normalizeEditor(payload.editor);
+  const sections = Array.isArray(payload.arrangementSections)
+    ? payload.arrangementSections.map(normalizeArrangementSection).slice(0, 80)
+    : [];
+  const isArrangementShare = payload.kind === SHARE_LINK_KINDS.arrangement;
+  return {
+    title: String(payload.title || "handpan-notation").trim() || "handpan-notation",
+    editor,
+    arrangementTitle: String(payload.arrangementTitle || payload.title || "handpan-notation").trim() || "handpan-notation",
+    arrangementScalePresetKey: normalizeArrangementScale(payload.arrangementScalePresetKey),
+    arrangementSections: sections,
+    previewMode:
+      (isArrangementShare || payload.previewMode === PREVIEW_MODES.print) && sections.length
+        ? PREVIEW_MODES.print
+        : PREVIEW_MODES.editor,
+  };
 }
 
 function isTextEntryTarget(target) {
@@ -610,13 +670,43 @@ function TransportHeader({
   );
 }
 
-function ShareExportPopup({ exportStatus, onClose, onExportPng }) {
+function ShareExportPopup({
+  canShareArrangement,
+  exportStatus,
+  onClose,
+  onCreateArrangementShareLink,
+  onCreatePatternShareLink,
+  onExportPng,
+  onCopyShareLink,
+  shareStatus,
+  shareUrl,
+}) {
   return (
     <div className="share-popover" role="dialog" aria-label="Share and export">
       <div className="share-popover-header">
-        <span>Export</span>
+        <span>Share</span>
         <button aria-label="Close export menu" onClick={onClose} type="button">×</button>
       </div>
+      <button className="share-action-button" onClick={onCreatePatternShareLink} type="button">
+        Share current grid
+      </button>
+      <button
+        className="share-action-button"
+        disabled={!canShareArrangement}
+        onClick={onCreateArrangementShareLink}
+        title={canShareArrangement ? "Share A4 arrangement" : "Add sections to the A4 arrangement first"}
+        type="button"
+      >
+        Share A4 arrangement
+      </button>
+      {shareUrl ? (
+        <div className="share-link-box">
+          <input aria-label="Share link" readOnly type="text" value={shareUrl} />
+          <button onClick={onCopyShareLink} type="button">Copy</button>
+        </div>
+      ) : null}
+      {shareStatus ? <div className="share-export-status">{shareStatus}</div> : null}
+      <div className="share-popover-divider" />
       <button className="share-action-button" onClick={onExportPng} type="button">
         Export 4K PNG
       </button>
@@ -1737,6 +1827,55 @@ function LibraryPanel({ library, onAddToArrangement, onDelete, onLoad, onRename,
   );
 }
 
+function LibraryAccountPanel({ authEmail, authStatus, hasConfig, isLoading, onEmailChange, onSignIn, onSignOut, session }) {
+  if (!hasConfig) {
+    return <div className="cloud-status">Supabase is not configured on this device.</div>;
+  }
+
+  if (session?.user?.email) {
+    return (
+      <div className="cloud-auth">
+        <div className="cloud-user">
+          <span>Signed in</span>
+          <strong>{session.user.email}</strong>
+        </div>
+        <ToolbarButton onClick={onSignOut}>Sign out</ToolbarButton>
+        {isLoading ? <div className="cloud-status">Syncing cloud library...</div> : null}
+        {authStatus ? <div className="cloud-status">{authStatus}</div> : null}
+      </div>
+    );
+  }
+
+  return (
+    <form className="cloud-auth" onSubmit={onSignIn}>
+      <input
+        aria-label="Email address"
+        onChange={(event) => onEmailChange(event.target.value)}
+        placeholder="email"
+        type="email"
+        value={authEmail}
+      />
+      <ToolbarButton disabled={!authEmail.trim()} type="submit">Email login link</ToolbarButton>
+      {authStatus ? <div className="cloud-status">{authStatus}</div> : null}
+    </form>
+  );
+}
+
+function CloudMergePrompt({ count, onKeepCloud, onMerge }) {
+  return (
+    <div className="cloud-merge-prompt">
+      <strong>Local patterns found</strong>
+      <span>
+        {count} local pattern{count === 1 ? "" : "s"} can be merged into your cloud library.
+      </span>
+      <div className="cloud-merge-actions">
+        <ToolbarButton onClick={onMerge}>Merge</ToolbarButton>
+        <ToolbarButton onClick={onKeepCloud}>Cloud only</ToolbarButton>
+      </div>
+    </div>
+  );
+}
+
 function PreviewModeSwitch({ mode, onChange }) {
   return (
     <div className="segmented-control preview-tabs" aria-label="Preview mode">
@@ -2404,6 +2543,8 @@ export default function App() {
   const [preferencesTab, setPreferencesTab] = React.useState("defaults");
   const [legalOpen, setLegalOpen] = React.useState(false);
   const [exportStatus, setExportStatus] = React.useState("");
+  const [shareStatus, setShareStatus] = React.useState("");
+  const [shareUrl, setShareUrl] = React.useState("");
   const [selection, setSelection] = React.useState(null);
   const [arrangementSelection, setArrangementSelection] = React.useState(null);
   const [switchHandsMode, setSwitchHandsMode] = React.useState(false);
@@ -2412,7 +2553,17 @@ export default function App() {
   const [editorGridLeft, setEditorGridLeft] = React.useState(null);
   const [previewNoteRequest, setPreviewNoteRequest] = React.useState(null);
   const [subdivisionPopover, setSubdivisionPopover] = React.useState(null);
+  const [session, setSession] = React.useState(null);
+  const [authEmail, setAuthEmail] = React.useState("");
+  const [authStatus, setAuthStatus] = React.useState("");
+  const [cloudStatus, setCloudStatus] = React.useState("");
+  const [cloudLoading, setCloudLoading] = React.useState(false);
+  const [pendingCloudMerge, setPendingCloudMerge] = React.useState(null);
   const editorRef = React.useRef(editor);
+  const libraryRef = React.useRef(library);
+  const deviceLibraryRef = React.useRef(library);
+  const cloudHydratedRef = React.useRef(false);
+  const restoringDeviceLibraryRef = React.useRef(false);
   const arrangementSectionsRef = React.useRef(arrangementSections);
   const arrangementScalePresetRef = React.useRef(arrangementScalePresetKey);
   const previewModeRef = React.useRef(previewMode);
@@ -2458,6 +2609,80 @@ export default function App() {
     opened: false,
   });
 
+  const fetchCloudLibrary = React.useCallback(async () => {
+    if (!supabase) return [];
+    setCloudLoading(true);
+    setCloudStatus("");
+    const { data, error } = await supabase
+      .from("cloud_patterns")
+      .select("id,name,editor,created_at,updated_at")
+      .order("updated_at", { ascending: false });
+    setCloudLoading(false);
+    if (error) {
+      setCloudStatus(error.message);
+      return [];
+    }
+    return (data || []).map(normalizeCloudLibraryEntry);
+  }, []);
+
+  const refreshCloudLibrary = React.useCallback(async () => {
+    const nextLibrary = await fetchCloudLibrary();
+    setLibrary(nextLibrary);
+    return nextLibrary;
+  }, [fetchCloudLibrary]);
+
+  React.useEffect(() => {
+    if (!supabase) return undefined;
+    let active = true;
+    supabase.auth.getSession().then(({ data }) => {
+      if (active) setSession(data.session);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession);
+    });
+    return () => {
+      active = false;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    if (!session?.user?.id) {
+      if (cloudHydratedRef.current) {
+        cloudHydratedRef.current = false;
+        restoringDeviceLibraryRef.current = true;
+        setPendingCloudMerge(null);
+        setCloudStatus("");
+        setLibrary(deviceLibraryRef.current);
+      }
+      return undefined;
+    }
+
+    const localSnapshot = deviceLibraryRef.current;
+    const hasLocalPatterns = localSnapshot.length > 0;
+    const hydrateCloud = async () => {
+      const nextLibrary = await fetchCloudLibrary();
+      if (cancelled) return;
+      setLibrary(nextLibrary);
+      cloudHydratedRef.current = true;
+      if (hasLocalPatterns) {
+        setPendingCloudMerge({
+          patterns: localSnapshot.map((entry) => ({
+            ...entry,
+            editor: cloneEditor(entry.editor),
+          })),
+        });
+      } else {
+        setPendingCloudMerge(null);
+      }
+    };
+    hydrateCloud();
+    return () => {
+      cancelled = true;
+    };
+  }, [fetchCloudLibrary, session?.user?.id]);
+
   React.useEffect(() => {
     editorRef.current = editor;
     writeJson(DRAFT_STORAGE_KEY, editor);
@@ -2480,8 +2705,14 @@ export default function App() {
   }, [selection]);
 
   React.useEffect(() => {
-    writeJson(LIBRARY_STORAGE_KEY, library);
-  }, [library]);
+    libraryRef.current = library;
+    if (!session?.user?.id) {
+      if (restoringDeviceLibraryRef.current && library !== deviceLibraryRef.current) return;
+      restoringDeviceLibraryRef.current = false;
+      deviceLibraryRef.current = library;
+      writeJson(LIBRARY_STORAGE_KEY, library);
+    }
+  }, [library, session?.user?.id]);
 
   React.useEffect(() => {
     playbackSettingsRef.current = playbackSettings;
@@ -2526,6 +2757,45 @@ export default function App() {
       setEditor(next);
       return items.slice(1);
     });
+  }, []);
+
+  React.useEffect(() => {
+    const shareId = getShareIdFromUrl();
+    if (!shareId || !supabase) return;
+    let cancelled = false;
+    const loadSharedNotation = async () => {
+      setShareStatus("Loading shared notation...");
+      const { data, error } = await supabase
+        .from("share_links")
+        .select("payload")
+        .eq("id", shareId)
+        .maybeSingle();
+      if (cancelled) return;
+      if (error || !data?.payload) {
+        setShareStatus(error?.message || "Share link not found.");
+        return;
+      }
+      const shared = normalizeSharedPayload(data.payload);
+      if (!shared) {
+        setShareStatus("This share link is not a valid handpan notation.");
+        return;
+      }
+      setTitle(shared.title);
+      setEditor(shared.editor);
+      setPast([]);
+      setFuture([]);
+      setArrangementTitle(shared.arrangementTitle);
+      setArrangementScalePresetKey(shared.arrangementScalePresetKey);
+      setArrangementSections(shared.arrangementSections);
+      setPreviewMode(shared.previewMode);
+      setShareUrl(buildShareUrl(shareId));
+      setShareStatus("Loaded shared notation.");
+      window.setTimeout(() => setShareStatus(""), 2200);
+    };
+    loadSharedNotation();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const clearVisibleSelection = React.useCallback(() => {
@@ -2690,6 +2960,50 @@ export default function App() {
     });
   }, [commitEditor]);
 
+  const duplicateSelection = React.useCallback(() => {
+    const selected = selectionRef.current;
+    const source = editorRef.current;
+    if (!selected || !source?.systems?.length) return;
+    const stepCount = getStepCount(source);
+    const maxStep = source.systems.length * stepCount - 1;
+    const width = selected.stepEnd - selected.stepStart + 1;
+    const targetStartStep = selected.stepEnd + 1;
+    if (width <= 0 || targetStartStep > maxStep) return;
+
+    const rows = [];
+    for (let row = selected.rowStart; row <= selected.rowEnd; row += 1) {
+      const values = [];
+      for (let absoluteStep = selected.stepStart; absoluteStep <= selected.stepEnd; absoluteStep += 1) {
+        const cell = getCellFromAbsoluteStep(absoluteStep, row, stepCount);
+        values.push(source.systems[cell.systemIndex]?.[cell.rowIndex]?.[cell.stepIndex] || "");
+      }
+      rows.push(values);
+    }
+
+    commitEditor((draft) => {
+      rows.forEach((rowValues, rowOffset) => {
+        const targetRowIndex = selected.rowStart + rowOffset;
+        if (targetRowIndex < 0 || targetRowIndex >= HAND_LABELS.length) return;
+        rowValues.forEach((value, colOffset) => {
+          const absoluteStep = targetStartStep + colOffset;
+          if (absoluteStep > maxStep) return;
+          const targetCell = getCellFromAbsoluteStep(absoluteStep, targetRowIndex, stepCount);
+          const targetRow = draft.systems[targetCell.systemIndex]?.[targetCell.rowIndex];
+          if (!targetRow) return;
+          targetRow[targetCell.stepIndex] = value || "";
+        });
+      });
+      return draft;
+    });
+
+    setSelection({
+      rowStart: selected.rowStart,
+      rowEnd: selected.rowEnd,
+      stepStart: targetStartStep,
+      stepEnd: Math.min(targetStartStep + width - 1, maxStep),
+    });
+  }, [commitEditor]);
+
   const copyArrangementSelection = React.useCallback(() => {
     const selected = arrangementSelection;
     if (!selected) return;
@@ -2802,11 +3116,14 @@ export default function App() {
         event.preventDefault();
         if (previewModeRef.current === PREVIEW_MODES.print) pasteArrangementClipboardAtPointer();
         else pasteClipboardAtPointer();
+      } else if (key === "d" && previewModeRef.current === PREVIEW_MODES.editor && selectionRef.current) {
+        event.preventDefault();
+        duplicateSelection();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [arrangementSelection, copyArrangementSelection, copySelection, pasteArrangementClipboardAtPointer, pasteClipboardAtPointer]);
+  }, [arrangementSelection, copyArrangementSelection, copySelection, duplicateSelection, pasteArrangementClipboardAtPointer, pasteClipboardAtPointer]);
 
   React.useEffect(() => {
     const onKeyDown = (event) => {
@@ -3138,16 +3455,38 @@ export default function App() {
     }));
   }, [commitEditor]);
 
-  const savePattern = React.useCallback(() => {
+  const savePattern = React.useCallback(async () => {
     const name = title.trim() || "Untitled";
+    const now = new Date().toISOString();
+    if (session?.user?.id && supabase) {
+      setCloudStatus("Saving...");
+      const { data, error } = await supabase
+        .from("cloud_patterns")
+        .insert({
+          user_id: session.user.id,
+          name,
+          editor: cloneEditor(editorRef.current),
+          updated_at: now,
+        })
+        .select("id,name,editor,created_at,updated_at")
+        .single();
+      if (error) {
+        setCloudStatus(error.message);
+        return;
+      }
+      const entry = normalizeCloudLibraryEntry(data);
+      setLibrary((items) => [entry, ...items].slice(0, 80));
+      setCloudStatus("Saved to cloud.");
+      return;
+    }
     const entry = {
       id: makeId(),
       name,
-      updatedAt: new Date().toISOString(),
+      updatedAt: now,
       editor: cloneEditor(editorRef.current),
     };
     setLibrary((items) => [entry, ...items].slice(0, 80));
-  }, [title]);
+  }, [session?.user?.id, title]);
 
   const loadPattern = React.useCallback(
     (entry) => {
@@ -3157,33 +3496,80 @@ export default function App() {
     [commitEditor]
   );
 
-  const deletePattern = React.useCallback((id) => {
+  const deletePattern = React.useCallback(async (id) => {
+    if (session?.user?.id && supabase) {
+      setCloudStatus("");
+      const { error } = await supabase
+        .from("cloud_patterns")
+        .delete()
+        .eq("id", id)
+        .eq("user_id", session.user.id);
+      if (error) {
+        setCloudStatus(error.message);
+        refreshCloudLibrary();
+        return;
+      }
+    }
     setLibrary((items) => items.filter((entry) => entry.id !== id));
-  }, []);
+  }, [refreshCloudLibrary, session?.user?.id]);
 
-  const renamePattern = React.useCallback((id, name) => {
+  const renamePattern = React.useCallback(async (id, name) => {
+    const updatedAt = new Date().toISOString();
     setLibrary((items) =>
       items.map((entry) =>
         entry.id === id
-          ? { ...entry, name, updatedAt: new Date().toISOString() }
+          ? { ...entry, name, updatedAt }
           : entry
       )
     );
-  }, []);
+    if (session?.user?.id && supabase) {
+      const { error } = await supabase
+        .from("cloud_patterns")
+        .update({ name, updated_at: updatedAt })
+        .eq("id", id)
+        .eq("user_id", session.user.id);
+      if (error) {
+        setCloudStatus(error.message);
+        refreshCloudLibrary();
+      }
+    }
+  }, [refreshCloudLibrary, session?.user?.id]);
 
-  const updatePattern = React.useCallback((id) => {
+  const updatePattern = React.useCallback(async (id) => {
+    const updatedAt = new Date().toISOString();
+    if (session?.user?.id && supabase) {
+      setCloudStatus("Updating...");
+      const { data, error } = await supabase
+        .from("cloud_patterns")
+        .update({
+          editor: cloneEditor(editorRef.current),
+          updated_at: updatedAt,
+        })
+        .eq("id", id)
+        .eq("user_id", session.user.id)
+        .select("id,name,editor,created_at,updated_at")
+        .single();
+      if (error) {
+        setCloudStatus(error.message);
+        return;
+      }
+      const updatedEntry = normalizeCloudLibraryEntry(data);
+      setLibrary((items) => items.map((entry) => (entry.id === id ? updatedEntry : entry)));
+      setCloudStatus("Updated.");
+      return;
+    }
     setLibrary((items) =>
       items.map((entry) =>
         entry.id === id
           ? {
               ...entry,
-              updatedAt: new Date().toISOString(),
+              updatedAt,
               editor: cloneEditor(editorRef.current),
             }
           : entry
       )
     );
-  }, []);
+  }, [session?.user?.id]);
 
   const addLibraryEntryToArrangement = React.useCallback((entry) => {
     const section = {
@@ -3194,6 +3580,55 @@ export default function App() {
     setArrangementSections((items) => [...items, section].slice(0, 80));
     setPreviewMode(PREVIEW_MODES.print);
   }, []);
+
+  const signInWithEmail = React.useCallback(async (event) => {
+    event.preventDefault();
+    if (!supabase) return;
+    const email = authEmail.trim();
+    if (!email) return;
+    setAuthStatus("Sending login link...");
+    const { error } = await supabase.auth.signInWithOtp({
+      email,
+      options: {
+        emailRedirectTo: window.location.origin,
+      },
+    });
+    setAuthStatus(error ? error.message : "Check your email for the login link.");
+  }, [authEmail]);
+
+  const signOut = React.useCallback(async () => {
+    if (!supabase) return;
+    setAuthStatus("");
+    setCloudStatus("");
+    await supabase.auth.signOut();
+    setSession(null);
+  }, []);
+
+  const keepCloudOnly = React.useCallback(() => {
+    setPendingCloudMerge(null);
+    setCloudStatus("Using cloud library.");
+  }, []);
+
+  const mergeLocalIntoCloud = React.useCallback(async () => {
+    if (!supabase || !session?.user?.id || !pendingCloudMerge?.patterns?.length) return;
+    setCloudStatus("Merging local patterns...");
+    const now = new Date().toISOString();
+    const rows = pendingCloudMerge.patterns.map((entry) => ({
+      user_id: session.user.id,
+      name: String(entry?.name || "Untitled").trim() || "Untitled",
+      editor: cloneEditor(entry.editor),
+      created_at: String(entry?.updatedAt || now),
+      updated_at: now,
+    }));
+    const { error } = await supabase.from("cloud_patterns").insert(rows);
+    if (error) {
+      setCloudStatus(error.message);
+      return;
+    }
+    setPendingCloudMerge(null);
+    setCloudStatus("Merged local patterns into cloud.");
+    refreshCloudLibrary();
+  }, [pendingCloudMerge, refreshCloudLibrary, session?.user?.id]);
 
   const addCurrentToArrangement = React.useCallback(() => {
     const name = title.trim() || "Section";
@@ -3633,6 +4068,82 @@ export default function App() {
 
   React.useEffect(() => () => stopPlayback(), [stopPlayback]);
 
+  const createShareLink = React.useCallback(async (shareType = "pattern") => {
+    if (!supabase) {
+      setShareStatus("Supabase is not configured.");
+      return;
+    }
+    const isArrangementShare = shareType === "arrangement";
+    const sections = arrangementSectionsRef.current.map((section) => ({
+      id: section.id,
+      name: section.name,
+      editor: cloneEditor(section.editor),
+    }));
+    if (isArrangementShare && sections.length === 0) {
+      setShareStatus("Add sections to the A4 arrangement first.");
+      return;
+    }
+    setShareStatus(isArrangementShare ? "Creating arrangement share link..." : "Creating grid share link...");
+    const kind = isArrangementShare ? SHARE_LINK_KINDS.arrangement : SHARE_LINK_KINDS.pattern;
+    const payload = isArrangementShare
+      ? {
+          kind,
+          title: arrangementTitle,
+          editor: cloneEditor(editorRef.current),
+          arrangementTitle,
+          arrangementScalePresetKey,
+          arrangementSections: sections,
+          previewMode: PREVIEW_MODES.print,
+        }
+      : {
+          kind,
+          title,
+          editor: cloneEditor(editorRef.current),
+          arrangementTitle,
+          arrangementScalePresetKey,
+          arrangementSections: [],
+          previewMode: PREVIEW_MODES.editor,
+        };
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const id = makeShareId();
+      const { error } = await supabase.from("share_links").insert({
+        id,
+        kind,
+        payload,
+      });
+      if (!error) {
+        const url = buildShareUrl(id);
+        setShareUrl(url);
+        setShareStatus(isArrangementShare ? "Arrangement share link created." : "Grid share link created.");
+        try {
+          await navigator.clipboard?.writeText(url);
+          setShareStatus(
+            isArrangementShare
+              ? "Arrangement share link created and copied."
+              : "Grid share link created and copied."
+          );
+        } catch (_) {}
+        return;
+      }
+      if (error.code !== "23505") {
+        setShareStatus(error.message || "Could not create share link.");
+        return;
+      }
+    }
+    setShareStatus("Could not create a unique share link. Try again.");
+  }, [arrangementScalePresetKey, arrangementTitle, title]);
+
+  const copyShareLink = React.useCallback(async () => {
+    if (!shareUrl) return;
+    try {
+      await navigator.clipboard?.writeText(shareUrl);
+      setShareStatus("Copied share link.");
+    } catch (_) {
+      setShareStatus("Could not copy automatically.");
+    }
+  }, [shareUrl]);
+
   const exportPng = React.useCallback(async () => {
     setExportStatus("Exporting");
     try {
@@ -3679,9 +4190,15 @@ export default function App() {
       />
       {shareMenuOpen ? (
         <ShareExportPopup
+          canShareArrangement={arrangementSections.length > 0}
           exportStatus={exportStatus}
+          onCopyShareLink={copyShareLink}
           onClose={() => setShareMenuOpen(false)}
+          onCreateArrangementShareLink={() => createShareLink("arrangement")}
+          onCreatePatternShareLink={() => createShareLink("pattern")}
           onExportPng={exportPng}
+          shareStatus={shareStatus}
+          shareUrl={shareUrl}
         />
       ) : null}
       {transportMenuOpen ? (
@@ -3859,7 +4376,29 @@ export default function App() {
           ) : (
             <div className="sidebar-tab-panel">
               <section className="panel-section library-section">
-                <ToolbarButton onClick={savePattern}>Save current</ToolbarButton>
+                <h3>{session?.user?.id ? "Personal library" : "Local library"}</h3>
+                <LibraryAccountPanel
+                  authEmail={authEmail}
+                  authStatus={authStatus}
+                  hasConfig={hasSupabaseConfig}
+                  isLoading={cloudLoading}
+                  onEmailChange={setAuthEmail}
+                  onSignIn={signInWithEmail}
+                  onSignOut={signOut}
+                  session={session}
+                />
+                {pendingCloudMerge ? (
+                  <CloudMergePrompt
+                    count={pendingCloudMerge.patterns.length}
+                    onKeepCloud={keepCloudOnly}
+                    onMerge={mergeLocalIntoCloud}
+                  />
+                ) : null}
+                <ToolbarButton disabled={cloudLoading} onClick={savePattern}>
+                  {session?.user?.id ? "Save to cloud" : "Save current"}
+                </ToolbarButton>
+                {cloudStatus ? <div className="cloud-status">{cloudStatus}</div> : null}
+                {cloudLoading ? <div className="empty-library">Loading cloud library...</div> : null}
                 <LibraryPanel
                   library={library}
                   onAddToArrangement={addLibraryEntryToArrangement}
