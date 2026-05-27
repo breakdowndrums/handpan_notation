@@ -91,9 +91,12 @@ function drawNoteLabel(ctx, labelInfo, x, y, width, height, size, offsetY = 0) {
   if (!labelInfo?.text || !parts.length) return;
   if (parts.length >= 2) {
     const layout = getComboNoteLabelLayout({ cell: width, noteFont: size }, labelInfo);
-    drawLabelPart(ctx, parts[0], x + layout.topX, y + layout.topY, layout.topFont, "left");
-    drawCenteredText(ctx, "+", x, y, width, height, layout.plusFont, SEMIBOLD_FONT_FAMILY, 600, 0);
-    drawLabelPart(ctx, parts[1], x + layout.bottomX, y + layout.bottomY, layout.bottomFont, "right");
+    layout.parts.forEach((item) => {
+      drawLabelPart(ctx, item.part, x + item.x, y + item.y, item.fontSize, "center");
+    });
+    if (layout.showPlus) {
+      drawCenteredText(ctx, "+", x, y, width, height, layout.plusFont, SEMIBOLD_FONT_FAMILY, 600, 0);
+    }
     return;
   }
   drawLabelPart(ctx, parts[0], x + width / 2, y + height / 2 + 1 + offsetY, size, "center");

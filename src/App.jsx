@@ -102,6 +102,10 @@ const NOTE_FREQUENCIES = {
   A4: 440,
   C5: 523.25,
 };
+
+function isTouchLikePointer(event) {
+  return event?.pointerType === "touch" || event?.pointerType === "pen";
+}
 const A4_PRINT = {
   width: 2100,
   height: 2970,
@@ -529,25 +533,19 @@ function CellNoteLabel({ format, labelInfo }) {
     const comboLayout = getComboNoteLabelLayout(format, labelInfo);
     return (
       <span className="cell-note cell-note-combo">
-        <NoteLabelPart
-          className="combo-part combo-top-left"
-          part={parts[0]}
-          style={{
-            fontSize: comboLayout.topFont,
-            left: comboLayout.topX,
-            top: comboLayout.topY,
-          }}
-        />
-        <span className="combo-plus" style={{ fontSize: comboLayout.plusFont }}>+</span>
-        <NoteLabelPart
-          className="combo-part combo-bottom-right"
-          part={parts[1]}
-          style={{
-            bottom: format.cell - comboLayout.bottomY,
-            fontSize: comboLayout.bottomFont,
-            right: format.cell - comboLayout.bottomX,
-          }}
-        />
+        {comboLayout.parts.map((item, index) => (
+          <NoteLabelPart
+            className="combo-part"
+            key={`${item.part.text}-${index}`}
+            part={item.part}
+            style={{
+              fontSize: item.fontSize,
+              left: item.x,
+              top: item.y,
+            }}
+          />
+        ))}
+        {comboLayout.showPlus ? <span className="combo-plus" style={{ fontSize: comboLayout.plusFont }}>+</span> : null}
       </span>
     );
   }
@@ -2051,20 +2049,29 @@ function SvgCellNoteLabel({ cell, fontSize, labelInfo, x, y }) {
     const comboLayout = getComboNoteLabelLayout({ cell, noteFont: fontSize }, labelInfo);
     return (
       <g>
-        <SvgNoteLabelPart anchor="start" fontSize={comboLayout.topFont} part={parts[0]} x={x + comboLayout.topX} y={y + comboLayout.topY} />
-        <text
-          dominantBaseline="middle"
-          fill="#ffffff"
-          fontFamily="MyriadProSemibold, Myriad Pro, Arial, sans-serif"
-          fontSize={comboLayout.plusFont}
-          fontWeight="600"
-          textAnchor="middle"
-          x={x + cell / 2}
-          y={y + cell / 2 + 1}
-        >
-          +
-        </text>
-        <SvgNoteLabelPart anchor="end" fontSize={comboLayout.bottomFont} part={parts[1]} x={x + comboLayout.bottomX} y={y + comboLayout.bottomY} />
+        {comboLayout.parts.map((item, index) => (
+          <SvgNoteLabelPart
+            fontSize={item.fontSize}
+            key={`${item.part.text}-${index}`}
+            part={item.part}
+            x={x + item.x}
+            y={y + item.y}
+          />
+        ))}
+        {comboLayout.showPlus ? (
+          <text
+            dominantBaseline="middle"
+            fill="#ffffff"
+            fontFamily="MyriadProSemibold, Myriad Pro, Arial, sans-serif"
+            fontSize={comboLayout.plusFont}
+            fontWeight="600"
+            textAnchor="middle"
+            x={x + cell / 2}
+            y={y + cell / 2 + 1}
+          >
+            +
+          </text>
+        ) : null}
       </g>
     );
   }
@@ -2826,6 +2833,7 @@ export default function App() {
   const handleCellPointerDown = React.useCallback((event, cell) => {
     if (event.button !== 0 || isTextEntryTarget(event.target)) return;
     hoveredCellRef.current = cell;
+    if (isTouchLikePointer(event)) return;
     const gesture = selectionGestureRef.current;
     if (gesture.timer) window.clearTimeout(gesture.timer);
     selectionGestureRef.current = {
@@ -3261,8 +3269,9 @@ export default function App() {
 
   const handleArrangementCellPointerDown = React.useCallback((event, cell) => {
     if (event.button != null && event.button !== 0) return;
-    event.preventDefault();
     hoveredArrangementCellRef.current = cell;
+    if (isTouchLikePointer(event)) return;
+    event.preventDefault();
     arrangementSelectionGestureRef.current = {
       anchor: cell,
       active: true,

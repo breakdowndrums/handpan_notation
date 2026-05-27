@@ -496,26 +496,49 @@ function estimateLabelWidthFactor(text) {
     }, 0.08);
 }
 
-function getComboPartFontSize(format, part, plusFont) {
+function getFittedLabelFontSize(format, part, box) {
   const cell = format.cell;
   const markerReserve = part?.marker ? 1.18 : 1;
-  const availableWidth = Math.max(8, cell * 0.5 - cell * 0.06 - plusFont * 0.35);
-  const availableHeight = cell * 0.48;
+  const availableWidth = Math.max(8, cell * box.w);
+  const availableHeight = Math.max(8, cell * box.h);
   const widthSize = availableWidth / Math.max(0.5, estimateLabelWidthFactor(part?.text) * markerReserve);
-  return Math.max(8, Math.min(format.noteFont, availableHeight, widthSize));
+  return Math.max(7, Math.min(format.noteFont, availableHeight, widthSize) * 0.96);
 }
 
 export function getComboNoteLabelLayout(format, labelInfo) {
-  const parts = labelInfo?.parts || [];
+  const parts = (labelInfo?.parts || []).slice(0, 4);
+  const count = parts.length;
   const plusFont = Math.max(9, Math.min(format.noteFont * 0.28, format.cell * 0.22));
+  const layouts = {
+    2: [
+      { x: 0.28, y: 0.27, w: 0.48, h: 0.43 },
+      { x: 0.72, y: 0.73, w: 0.48, h: 0.43 },
+    ],
+    3: [
+      { x: 0.5, y: 0.24, w: 0.72, h: 0.34 },
+      { x: 0.29, y: 0.72, w: 0.44, h: 0.34 },
+      { x: 0.71, y: 0.72, w: 0.44, h: 0.34 },
+    ],
+    4: [
+      { x: 0.29, y: 0.29, w: 0.44, h: 0.34 },
+      { x: 0.71, y: 0.29, w: 0.44, h: 0.34 },
+      { x: 0.29, y: 0.71, w: 0.44, h: 0.34 },
+      { x: 0.71, y: 0.71, w: 0.44, h: 0.34 },
+    ],
+  };
+  const boxes = layouts[Math.min(4, Math.max(2, count))] || layouts[2];
   return {
     plusFont,
-    topFont: getComboPartFontSize(format, parts[0], plusFont),
-    bottomFont: getComboPartFontSize(format, parts[1], plusFont),
-    topX: format.cell * 0.06,
-    topY: format.cell * 0.25,
-    bottomX: format.cell * 0.94,
-    bottomY: format.cell * 0.78,
+    showPlus: count === 2,
+    parts: parts.map((part, index) => {
+      const box = boxes[index] || boxes[boxes.length - 1];
+      return {
+        part,
+        fontSize: getFittedLabelFontSize(format, part, box),
+        x: format.cell * box.x,
+        y: format.cell * box.y,
+      };
+    }),
   };
 }
 
